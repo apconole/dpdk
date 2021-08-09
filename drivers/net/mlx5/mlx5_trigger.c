@@ -228,12 +228,11 @@ mlx5_hairpin_auto_bind(struct rte_eth_dev *dev)
 		txq_ctrl = mlx5_txq_get(dev, i);
 		if (!txq_ctrl)
 			continue;
-		if (txq_ctrl->type != MLX5_TXQ_TYPE_HAIRPIN) {
+		if (txq_ctrl->type != MLX5_TXQ_TYPE_HAIRPIN ||
+		    txq_ctrl->hairpin_conf.peers[0].port != self_port) {
 			mlx5_txq_release(dev, i);
 			continue;
 		}
-		if (txq_ctrl->hairpin_conf.peers[0].port != self_port)
-			continue;
 		if (txq_ctrl->hairpin_conf.manual_bind) {
 			mlx5_txq_release(dev, i);
 			return 0;
@@ -247,13 +246,12 @@ mlx5_hairpin_auto_bind(struct rte_eth_dev *dev)
 		txq_ctrl = mlx5_txq_get(dev, i);
 		if (!txq_ctrl)
 			continue;
-		if (txq_ctrl->type != MLX5_TXQ_TYPE_HAIRPIN) {
+		/* Skip hairpin queues with other peer ports. */
+		if (txq_ctrl->type != MLX5_TXQ_TYPE_HAIRPIN ||
+		    txq_ctrl->hairpin_conf.peers[0].port != self_port) {
 			mlx5_txq_release(dev, i);
 			continue;
 		}
-		/* Skip hairpin queues with other peer ports. */
-		if (txq_ctrl->hairpin_conf.peers[0].port != self_port)
-			continue;
 		if (!txq_ctrl->obj) {
 			rte_errno = ENOMEM;
 			DRV_LOG(ERR, "port %u no txq object found: %d",
@@ -697,7 +695,7 @@ mlx5_hairpin_bind_single_port(struct rte_eth_dev *dev, uint16_t rx_port)
 	uint32_t explicit;
 	uint16_t rx_queue;
 
-	if (mlx5_eth_find_next(rx_port, priv->pci_dev) != rx_port) {
+	if (mlx5_eth_find_next(rx_port, dev->device) != rx_port) {
 		rte_errno = ENODEV;
 		DRV_LOG(ERR, "Rx port %u does not belong to mlx5", rx_port);
 		return -rte_errno;
@@ -835,7 +833,7 @@ mlx5_hairpin_unbind_single_port(struct rte_eth_dev *dev, uint16_t rx_port)
 	int ret;
 	uint16_t cur_port = priv->dev_data->port_id;
 
-	if (mlx5_eth_find_next(rx_port, priv->pci_dev) != rx_port) {
+	if (mlx5_eth_find_next(rx_port, dev->device) != rx_port) {
 		rte_errno = ENODEV;
 		DRV_LOG(ERR, "Rx port %u does not belong to mlx5", rx_port);
 		return -rte_errno;
@@ -893,7 +891,6 @@ mlx5_hairpin_bind(struct rte_eth_dev *dev, uint16_t rx_port)
 {
 	int ret = 0;
 	uint16_t p, pp;
-	struct mlx5_priv *priv = dev->data->dev_private;
 
 	/*
 	 * If the Rx port has no hairpin configuration with the current port,
@@ -902,7 +899,7 @@ mlx5_hairpin_bind(struct rte_eth_dev *dev, uint16_t rx_port)
 	 * information updating.
 	 */
 	if (rx_port == RTE_MAX_ETHPORTS) {
-		MLX5_ETH_FOREACH_DEV(p, priv->pci_dev) {
+		MLX5_ETH_FOREACH_DEV(p, dev->device) {
 			ret = mlx5_hairpin_bind_single_port(dev, p);
 			if (ret != 0)
 				goto unbind;
@@ -912,7 +909,7 @@ mlx5_hairpin_bind(struct rte_eth_dev *dev, uint16_t rx_port)
 		return mlx5_hairpin_bind_single_port(dev, rx_port);
 	}
 unbind:
-	MLX5_ETH_FOREACH_DEV(pp, priv->pci_dev)
+	MLX5_ETH_FOREACH_DEV(pp, dev->device)
 		if (pp < p)
 			mlx5_hairpin_unbind_single_port(dev, pp);
 	return ret;
@@ -927,10 +924,9 @@ mlx5_hairpin_unbind(struct rte_eth_dev *dev, uint16_t rx_port)
 {
 	int ret = 0;
 	uint16_t p;
-	struct mlx5_priv *priv = dev->data->dev_private;
 
 	if (rx_port == RTE_MAX_ETHPORTS)
-		MLX5_ETH_FOREACH_DEV(p, priv->pci_dev) {
+		MLX5_ETH_FOREACH_DEV(p, dev->device) {
 			ret = mlx5_hairpin_unbind_single_port(dev, p);
 			if (ret != 0)
 				return ret;
@@ -1187,7 +1183,7 @@ mlx5_dev_stop(struct rte_eth_dev *dev)
 	/* Control flows for default traffic can be removed firstly. */
 	mlx5_traffic_disable(dev);
 	/* All RX queue flags will be cleared in the flush interface. */
-	mlx5_flow_list_flush(dev, &priv->flows, true);
+	mlx5_flow_list_flush(dev, MLX5_FLOW_TYPE_GEN, true);
 	mlx5_flow_meter_rxq_flush(dev);
 	mlx5_rx_intr_vec_disable(dev);
 	priv->sh->port[priv->dev_port - 1].ih_port_id = RTE_MAX_ETHPORTS;
@@ -1261,7 +1257,7 @@ mlx5_traffic_enable(struct rte_eth_dev *dev)
 		}
 		mlx5_txq_release(dev, i);
 	}
-	if (priv->config.dv_esw_en && !priv->config.vf) {
+	if (priv->config.dv_esw_en && !priv->config.vf && !priv->config.sf) {
 		if (mlx5_flow_create_esw_table_zero_flow(dev))
 			priv->fdb_def_rule = 1;
 		else
@@ -1370,7 +1366,7 @@ mlx5_traffic_enable(struct rte_eth_dev *dev)
 	return 0;
 error:
 	ret = rte_errno; /* Save rte_errno before cleanup. */
-	mlx5_flow_list_flush(dev, &priv->ctrl_flows, false);
+	mlx5_flow_list_flush(dev, MLX5_FLOW_TYPE_CTL, false);
 	rte_errno = ret; /* Restore rte_errno. */
 	return -rte_errno;
 }
@@ -1385,9 +1381,7 @@ error:
 void
 mlx5_traffic_disable(struct rte_eth_dev *dev)
 {
-	struct mlx5_priv *priv = dev->data->dev_private;
-
-	mlx5_flow_list_flush(dev, &priv->ctrl_flows, false);
+	mlx5_flow_list_flush(dev, MLX5_FLOW_TYPE_CTL, false);
 }
 
 /**

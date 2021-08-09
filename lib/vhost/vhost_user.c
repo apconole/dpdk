@@ -1248,6 +1248,7 @@ vhost_user_set_mem_table(struct virtio_net **pdev, struct VhostUserMsg *msg,
 	int numa_node = SOCKET_ID_ANY;
 	uint64_t mmap_offset;
 	uint32_t i;
+	bool async_notify = false;
 
 	if (validate_msg_fds(msg, memory->nregions) != 0)
 		return RTE_VHOST_MSG_RESULT_ERR;
@@ -1275,6 +1276,16 @@ vhost_user_set_mem_table(struct virtio_net **pdev, struct VhostUserMsg *msg,
 				vdpa_dev->ops->dev_close(dev->vid);
 			dev->flags &= ~VIRTIO_DEV_VDPA_CONFIGURED;
 		}
+
+		/* notify the vhost application to stop DMA transfers */
+		if (dev->async_copy && dev->notify_ops->vring_state_changed) {
+			for (i = 0; i < dev->nr_vring; i++) {
+				dev->notify_ops->vring_state_changed(dev->vid,
+						i, 0);
+			}
+			async_notify = true;
+		}
+
 		free_mem_region(dev);
 		rte_free(dev->mem);
 		dev->mem = NULL;
@@ -1370,6 +1381,11 @@ vhost_user_set_mem_table(struct virtio_net **pdev, struct VhostUserMsg *msg,
 	}
 
 	dump_guest_pages(dev);
+
+	if (async_notify) {
+		for (i = 0; i < dev->nr_vring; i++)
+			dev->notify_ops->vring_state_changed(dev->vid, i, 1);
+	}
 
 	return RTE_VHOST_MSG_RESULT_OK;
 
@@ -2780,6 +2796,7 @@ vhost_user_check_and_alloc_queue_pair(struct virtio_net *dev,
 		break;
 	case VHOST_USER_SET_VRING_NUM:
 	case VHOST_USER_SET_VRING_BASE:
+	case VHOST_USER_GET_VRING_BASE:
 	case VHOST_USER_SET_VRING_ENABLE:
 		vring_idx = msg->payload.state.index;
 		break;
@@ -2995,9 +3012,6 @@ skip_to_post_handle:
 		}
 	}
 
-	if (unlock_required)
-		vhost_user_unlock_all_queue_pairs(dev);
-
 	/* If message was not handled at this stage, treat it as an error */
 	if (!handled) {
 		VHOST_LOG_CONFIG(ERR,
@@ -3032,6 +3046,8 @@ skip_to_post_handle:
 		}
 	}
 
+	if (unlock_required)
+		vhost_user_unlock_all_queue_pairs(dev);
 
 	if (!virtio_is_ready(dev))
 		goto out;

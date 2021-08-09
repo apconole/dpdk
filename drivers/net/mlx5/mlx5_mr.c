@@ -7,7 +7,6 @@
 #include <rte_mempool.h>
 #include <rte_malloc.h>
 #include <rte_rwlock.h>
-#include <rte_bus_pci.h>
 
 #include <mlx5_common_mp.h>
 #include <mlx5_common_mr.h>
@@ -199,33 +198,33 @@ mlx5_mr_update_ext_mp_cb(struct rte_mempool *mp, void *opaque,
 }
 
 /**
- * Finds the first ethdev that match the pci device.
+ * Finds the first ethdev that match the device.
  * The existence of multiple ethdev per pci device is only with representors.
  * On such case, it is enough to get only one of the ports as they all share
  * the same ibv context.
  *
- * @param pdev
- *   Pointer to the PCI device.
+ * @param dev
+ *   Pointer to the device.
  *
  * @return
  *   Pointer to the ethdev if found, NULL otherwise.
  */
 static struct rte_eth_dev *
-pci_dev_to_eth_dev(struct rte_pci_device *pdev)
+dev_to_eth_dev(struct rte_device *dev)
 {
 	uint16_t port_id;
 
-	port_id = rte_eth_find_next_of(0, &pdev->device);
+	port_id = rte_eth_find_next_of(0, dev);
 	if (port_id == RTE_MAX_ETHPORTS)
 		return NULL;
 	return &rte_eth_devices[port_id];
 }
 
 /**
- * DPDK callback to DMA map external memory to a PCI device.
+ * Callback to DMA map external memory to a device.
  *
- * @param pdev
- *   Pointer to the PCI device.
+ * @param rte_dev
+ *   Pointer to the generic device.
  * @param addr
  *   Starting virtual address of memory to be mapped.
  * @param iova
@@ -237,18 +236,18 @@ pci_dev_to_eth_dev(struct rte_pci_device *pdev)
  *   0 on success, negative value on error.
  */
 int
-mlx5_dma_map(struct rte_pci_device *pdev, void *addr,
-	     uint64_t iova __rte_unused, size_t len)
+mlx5_net_dma_map(struct rte_device *rte_dev, void *addr,
+		 uint64_t iova __rte_unused, size_t len)
 {
 	struct rte_eth_dev *dev;
 	struct mlx5_mr *mr;
 	struct mlx5_priv *priv;
 	struct mlx5_dev_ctx_shared *sh;
 
-	dev = pci_dev_to_eth_dev(pdev);
+	dev = dev_to_eth_dev(rte_dev);
 	if (!dev) {
 		DRV_LOG(WARNING, "unable to find matching ethdev "
-				 "to PCI device %p", (void *)pdev);
+				 "to device %s", rte_dev->name);
 		rte_errno = ENODEV;
 		return -1;
 	}
@@ -271,10 +270,10 @@ mlx5_dma_map(struct rte_pci_device *pdev, void *addr,
 }
 
 /**
- * DPDK callback to DMA unmap external memory to a PCI device.
+ * Callback to DMA unmap external memory to a device.
  *
- * @param pdev
- *   Pointer to the PCI device.
+ * @param rte_dev
+ *   Pointer to the generic device.
  * @param addr
  *   Starting virtual address of memory to be unmapped.
  * @param iova
@@ -286,8 +285,8 @@ mlx5_dma_map(struct rte_pci_device *pdev, void *addr,
  *   0 on success, negative value on error.
  */
 int
-mlx5_dma_unmap(struct rte_pci_device *pdev, void *addr,
-	       uint64_t iova __rte_unused, size_t len __rte_unused)
+mlx5_net_dma_unmap(struct rte_device *rte_dev, void *addr,
+		   uint64_t iova __rte_unused, size_t len __rte_unused)
 {
 	struct rte_eth_dev *dev;
 	struct mlx5_priv *priv;
@@ -295,10 +294,10 @@ mlx5_dma_unmap(struct rte_pci_device *pdev, void *addr,
 	struct mlx5_mr *mr;
 	struct mr_cache_entry entry;
 
-	dev = pci_dev_to_eth_dev(pdev);
+	dev = dev_to_eth_dev(rte_dev);
 	if (!dev) {
-		DRV_LOG(WARNING, "unable to find matching ethdev "
-				 "to PCI device %p", (void *)pdev);
+		DRV_LOG(WARNING, "unable to find matching ethdev to device %s",
+			rte_dev->name);
 		rte_errno = ENODEV;
 		return -1;
 	}
@@ -308,16 +307,15 @@ mlx5_dma_unmap(struct rte_pci_device *pdev, void *addr,
 	mr = mlx5_mr_lookup_list(&sh->share_cache, &entry, (uintptr_t)addr);
 	if (!mr) {
 		rte_rwlock_write_unlock(&sh->share_cache.rwlock);
-		DRV_LOG(WARNING, "address 0x%" PRIxPTR " wasn't registered "
-				 "to PCI device %p", (uintptr_t)addr,
-				 (void *)pdev);
+		DRV_LOG(WARNING, "address 0x%" PRIxPTR " wasn't registered to device %s",
+			(uintptr_t)addr, rte_dev->name);
 		rte_errno = EINVAL;
 		return -1;
 	}
 	LIST_REMOVE(mr, mr);
-	mlx5_mr_free(mr, sh->share_cache.dereg_mr_cb);
 	DRV_LOG(DEBUG, "port %u remove MR(%p) from list", dev->data->port_id,
 	      (void *)mr);
+	mlx5_mr_free(mr, sh->share_cache.dereg_mr_cb);
 	mlx5_mr_rebuild_cache(&sh->share_cache);
 	/*
 	 * No explicit wmb is needed after updating dev_gen due to

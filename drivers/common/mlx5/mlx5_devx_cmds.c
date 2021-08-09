@@ -819,6 +819,8 @@ mlx5_devx_cmd_query_hca_attr(void *ctx,
 	attr->roce = MLX5_GET(cmd_hca_cap, hcattr, roce);
 	attr->rq_ts_format = MLX5_GET(cmd_hca_cap, hcattr, rq_ts_format);
 	attr->sq_ts_format = MLX5_GET(cmd_hca_cap, hcattr, sq_ts_format);
+	attr->steering_format_version =
+		MLX5_GET(cmd_hca_cap, hcattr, steering_format_version);
 	attr->regex = MLX5_GET(cmd_hca_cap, hcattr, regexp);
 	attr->regexp_num_of_engines = MLX5_GET(cmd_hca_cap, hcattr,
 					       regexp_num_of_engines);
@@ -947,7 +949,16 @@ mlx5_devx_cmd_query_hca_attr(void *ctx,
 	attr->log_max_ft_sampler_num = MLX5_GET
 		(flow_table_nic_cap, hcattr,
 		 flow_table_properties_nic_receive.log_max_ft_sampler_num);
+	attr->flow.tunnel_header_0_1 = MLX5_GET
+		(flow_table_nic_cap, hcattr,
+		 ft_field_support_2_nic_receive.tunnel_header_0_1);
 	attr->pkt_integrity_match = mlx5_devx_query_pkt_integrity_match(hcattr);
+	attr->inner_ipv4_ihl = MLX5_GET
+		(flow_table_nic_cap, hcattr,
+		 ft_field_support_2_nic_receive.inner_ipv4_ihl);
+	attr->outer_ipv4_ihl = MLX5_GET
+		(flow_table_nic_cap, hcattr,
+		 ft_field_support_2_nic_receive.outer_ipv4_ihl);
 	/* Query HCA offloads for Ethernet protocol. */
 	memset(in, 0, sizeof(in));
 	memset(out, 0, sizeof(out));

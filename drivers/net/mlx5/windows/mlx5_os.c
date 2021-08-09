@@ -30,12 +30,48 @@
 #include "mlx5_flow.h"
 #include "mlx5_devx.h"
 
-#define MLX5_TAGS_HLIST_ARRAY_SIZE 8192
-
 static const char *MZ_MLX5_PMD_SHARED_DATA = "mlx5_pmd_shared_data";
 
 /* Spinlock for mlx5_shared_data allocation. */
 static rte_spinlock_t mlx5_shared_data_lock = RTE_SPINLOCK_INITIALIZER;
+
+/* rte flow indexed pool configuration. */
+static struct mlx5_indexed_pool_config icfg[] = {
+	{
+		.size = sizeof(struct rte_flow),
+		.trunk_size = 64,
+		.need_lock = 1,
+		.release_mem_en = 0,
+		.malloc = mlx5_malloc,
+		.free = mlx5_free,
+		.per_core_cache = 0,
+		.type = "ctl_flow_ipool",
+	},
+	{
+		.size = sizeof(struct rte_flow),
+		.trunk_size = 64,
+		.grow_trunk = 3,
+		.grow_shift = 2,
+		.need_lock = 1,
+		.release_mem_en = 0,
+		.malloc = mlx5_malloc,
+		.free = mlx5_free,
+		.per_core_cache = 1 << 14,
+		.type = "rte_flow_ipool",
+	},
+	{
+		.size = sizeof(struct rte_flow),
+		.trunk_size = 64,
+		.grow_trunk = 3,
+		.grow_shift = 2,
+		.need_lock = 1,
+		.release_mem_en = 0,
+		.malloc = mlx5_malloc,
+		.free = mlx5_free,
+		.per_core_cache = 0,
+		.type = "mcp_flow_ipool",
+	},
+};
 
 /**
  * Initialize shared data between primary and secondary process.
@@ -319,6 +355,7 @@ mlx5_dev_spawn(struct rte_device *dpdk_dev,
 	char name[RTE_ETH_NAME_MAX_LEN];
 	int own_domain_id = 0;
 	uint16_t port_id;
+	int i;
 
 	/* Build device name. */
 	strlcpy(name, dpdk_dev->name, sizeof(name));
@@ -393,7 +430,7 @@ mlx5_dev_spawn(struct rte_device *dpdk_dev,
 	 * Look for sibling devices in order to reuse their switch domain
 	 * if any, otherwise allocate one.
 	 */
-	MLX5_ETH_FOREACH_DEV(port_id, priv->pci_dev) {
+	MLX5_ETH_FOREACH_DEV(port_id, dpdk_dev) {
 		const struct mlx5_priv *opriv =
 			rte_eth_devices[port_id].data->dev_private;
 
@@ -417,7 +454,7 @@ mlx5_dev_spawn(struct rte_device *dpdk_dev,
 	}
 	/* Override some values set by hardware configuration. */
 	mlx5_args(config, dpdk_dev->devargs);
-	err = mlx5_dev_check_sibling_config(priv, config);
+	err = mlx5_dev_check_sibling_config(priv, config, dpdk_dev);
 	if (err)
 		goto error;
 	DRV_LOG(DEBUG, "counters are not supported");
@@ -563,7 +600,6 @@ mlx5_dev_spawn(struct rte_device *dpdk_dev,
 	eth_dev->rx_queue_count = mlx5_rx_queue_count;
 	/* Register MAC address. */
 	claim_zero(mlx5_mac_addr_add(eth_dev, &mac, 0, 0));
-	priv->flows = 0;
 	priv->ctrl_flows = 0;
 	TAILQ_INIT(&priv->flow_meters);
 	priv->mtr_profile_tbl = mlx5_l3t_create(MLX5_L3T_TYPE_PTR);
@@ -587,6 +623,14 @@ mlx5_dev_spawn(struct rte_device *dpdk_dev,
 	mlx5_set_min_inline(spawn, config);
 	/* Store device configuration on private structure. */
 	priv->config = *config;
+	for (i = 0; i < MLX5_FLOW_TYPE_MAXI; i++) {
+		icfg[i].release_mem_en = !!config->reclaim_mode;
+		if (config->reclaim_mode)
+			icfg[i].per_core_cache = 0;
+		priv->flows[i] = mlx5_ipool_create(&icfg[i]);
+		if (!priv->flows[i])
+			goto error;
+	}
 	/* Create context for virtual machine VLAN workaround. */
 	priv->vmwa_context = NULL;
 	if (config->dv_flow_en) {
@@ -611,10 +655,10 @@ mlx5_dev_spawn(struct rte_device *dpdk_dev,
 			err = ENOTSUP;
 			goto error;
 	}
-	mlx5_cache_list_init(&priv->hrxqs, "hrxq", 0, eth_dev,
-			     mlx5_hrxq_create_cb,
-			     mlx5_hrxq_match_cb,
-			     mlx5_hrxq_remove_cb);
+	priv->hrxqs = mlx5_list_create("hrxq", eth_dev, true,
+		mlx5_hrxq_create_cb, mlx5_hrxq_match_cb,
+		mlx5_hrxq_remove_cb, mlx5_hrxq_clone_cb,
+		mlx5_hrxq_clone_free_cb);
 	/* Query availability of metadata reg_c's. */
 	err = mlx5_flow_discover_mreg_c(eth_dev);
 	if (err < 0) {
@@ -925,20 +969,18 @@ mlx5_match_devx_devices_to_addr(struct devx_device_bdf *devx_bdf,
 /**
  * DPDK callback to register a PCI device.
  *
- * This function spawns Ethernet devices out of a given PCI device.
+ * This function spawns Ethernet devices out of a given device.
  *
- * @param[in] pci_drv
- *   PCI driver structure (mlx5_driver).
- * @param[in] pci_dev
- *   PCI device information.
+ * @param[in] dev
+ *   Pointer to the generic device.
  *
  * @return
  *   0 on success, a negative errno value otherwise and rte_errno is set.
  */
 int
-mlx5_os_pci_probe(struct rte_pci_driver *pci_drv __rte_unused,
-		  struct rte_pci_device *pci_dev)
+mlx5_os_net_probe(struct rte_device *dev)
 {
+	struct rte_pci_device *pci_dev = RTE_DEV_TO_PCI(dev);
 	struct devx_device_bdf *devx_bdf_devs, *orig_devx_bdf_devs;
 	/*
 	 * Number of found IB Devices matching with requested PCI BDF.
@@ -1083,6 +1125,7 @@ mlx5_os_pci_probe(struct rte_pci_driver *pci_drv __rte_unused,
 	dev_config.dv_flow_en = 1;
 	dev_config.decap_en = 0;
 	dev_config.log_hp_size = MLX5_ARG_UNSET;
+	list[ns].numa_node = pci_dev->device.numa_node;
 	list[ns].eth_dev = mlx5_dev_spawn(&pci_dev->device,
 					  &list[ns],
 					  &dev_config);

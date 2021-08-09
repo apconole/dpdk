@@ -171,6 +171,7 @@ enum index {
 	ITEM_VLAN_INNER_TYPE,
 	ITEM_VLAN_HAS_MORE_VLAN,
 	ITEM_IPV4,
+	ITEM_IPV4_VER_IHL,
 	ITEM_IPV4_TOS,
 	ITEM_IPV4_ID,
 	ITEM_IPV4_FRAGMENT_OFFSET,
@@ -205,6 +206,7 @@ enum index {
 	ITEM_SCTP_CKSUM,
 	ITEM_VXLAN,
 	ITEM_VXLAN_VNI,
+	ITEM_VXLAN_LAST_RSVD,
 	ITEM_E_TAG,
 	ITEM_E_TAG_GRP_ECID_B,
 	ITEM_NVGRE,
@@ -1069,6 +1071,7 @@ static const enum index item_vlan[] = {
 };
 
 static const enum index item_ipv4[] = {
+	ITEM_IPV4_VER_IHL,
 	ITEM_IPV4_TOS,
 	ITEM_IPV4_ID,
 	ITEM_IPV4_FRAGMENT_OFFSET,
@@ -1127,6 +1130,7 @@ static const enum index item_sctp[] = {
 
 static const enum index item_vxlan[] = {
 	ITEM_VXLAN_VNI,
+	ITEM_VXLAN_LAST_RSVD,
 	ITEM_NEXT,
 	ZERO,
 };
@@ -2576,6 +2580,14 @@ static const struct token token_list[] = {
 		.next = NEXT(item_ipv4),
 		.call = parse_vc,
 	},
+	[ITEM_IPV4_VER_IHL] = {
+		.name = "version_ihl",
+		.help = "match header length",
+		.next = NEXT(item_ipv4, NEXT_ENTRY(COMMON_UNSIGNED),
+			     item_param),
+		.args = ARGS(ARGS_ENTRY(struct rte_flow_item_ipv4,
+				     hdr.version_ihl)),
+	},
 	[ITEM_IPV4_TOS] = {
 		.name = "tos",
 		.help = "type of service",
@@ -2838,6 +2850,14 @@ static const struct token token_list[] = {
 		.next = NEXT(item_vxlan, NEXT_ENTRY(COMMON_UNSIGNED),
 			     item_param),
 		.args = ARGS(ARGS_ENTRY_HTON(struct rte_flow_item_vxlan, vni)),
+	},
+	[ITEM_VXLAN_LAST_RSVD] = {
+		.name = "last_rsvd",
+		.help = "VXLAN last reserved bits",
+		.next = NEXT(item_vxlan, NEXT_ENTRY(COMMON_UNSIGNED),
+			     item_param),
+		.args = ARGS(ARGS_ENTRY_HTON(struct rte_flow_item_vxlan,
+					     rsvd1)),
 	},
 	[ITEM_E_TAG] = {
 		.name = "e_tag",
@@ -8193,7 +8213,8 @@ update_fields(uint8_t *buf, struct rte_flow_item *item, uint16_t next_proto)
 		break;
 	case RTE_FLOW_ITEM_TYPE_IPV4:
 		ipv4 = (struct rte_ipv4_hdr *)buf;
-		ipv4->version_ihl = 0x45;
+		if (!ipv4->version_ihl)
+			ipv4->version_ihl = RTE_IPV4_VHL_DEF;
 		if (next_proto && ipv4->next_proto_id == 0)
 			ipv4->next_proto_id = (uint8_t)next_proto;
 		break;
@@ -8422,7 +8443,7 @@ cmd_set_raw_parsed_sample(const struct buffer *in)
 			action->conf = &sample_nvgre_encap[idx];
 			break;
 		default:
-			printf("Error - Not supported action\n");
+			fprintf(stderr, "Error - Not supported action\n");
 			return;
 		}
 		rte_memcpy(data, action, sizeof(struct rte_flow_action));
@@ -8547,13 +8568,15 @@ cmd_set_raw_parsed(const struct buffer *in)
 				break;
 			}
 			if (gtp_psc != i + 1) {
-				printf("Error - GTP PSC does not follow GTP\n");
+				fprintf(stderr,
+					"Error - GTP PSC does not follow GTP\n");
 				goto error;
 			}
 			gtp = item->spec;
 			if ((gtp->v_pt_rsv_flags & 0x07) != 0x04) {
 				/* Only E flag should be set. */
-				printf("Error - GTP unsupported flags\n");
+				fprintf(stderr,
+					"Error - GTP unsupported flags\n");
 				goto error;
 			} else {
 				struct rte_gtp_hdr_ext_word ext_word = {
@@ -8569,7 +8592,8 @@ cmd_set_raw_parsed(const struct buffer *in)
 			break;
 		case RTE_FLOW_ITEM_TYPE_GTP_PSC:
 			if (gtp_psc >= 0) {
-				printf("Error - Multiple GTP PSC items\n");
+				fprintf(stderr,
+					"Error - Multiple GTP PSC items\n");
 				goto error;
 			} else {
 				const struct rte_flow_item_gtp_psc
@@ -8583,8 +8607,8 @@ cmd_set_raw_parsed(const struct buffer *in)
 
 				if (opt->pdu_type & 0x0F) {
 					/* Support the minimal option only. */
-					printf("Error - GTP PSC option with "
-					       "extra fields not supported\n");
+					fprintf(stderr,
+						"Error - GTP PSC option with extra fields not supported\n");
 					goto error;
 				}
 				psc.len = sizeof(psc);
@@ -8602,7 +8626,7 @@ cmd_set_raw_parsed(const struct buffer *in)
 			size = sizeof(struct rte_flow_item_pfcp);
 			break;
 		default:
-			printf("Error - Not supported item\n");
+			fprintf(stderr, "Error - Not supported item\n");
 			goto error;
 		}
 		*total_size += size;
@@ -8730,7 +8754,8 @@ cmd_show_set_raw_parsed(void *parsed_result, struct cmdline *cl, void *data)
 		all = 1;
 		index = 0;
 	} else if (index >= RAW_ENCAP_CONFS_MAX_NUM) {
-		printf("index should be 0-%u\n", RAW_ENCAP_CONFS_MAX_NUM - 1);
+		fprintf(stderr, "index should be 0-%u\n",
+			RAW_ENCAP_CONFS_MAX_NUM - 1);
 		return;
 	}
 	do {

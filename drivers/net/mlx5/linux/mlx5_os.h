@@ -19,7 +19,6 @@ enum {
 
 #define MLX5_NAMESIZE IF_NAMESIZE
 
-#define PCI_DRV_FLAGS  (RTE_PCI_DRV_INTR_LSC | \
-			RTE_PCI_DRV_INTR_RMV | \
-			RTE_PCI_DRV_PROBE_AGAIN)
+int mlx5_auxiliary_get_ifindex(const char *sf_name);
+
 #endif /* RTE_PMD_MLX5_OS_H_ */

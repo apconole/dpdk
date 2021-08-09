@@ -10,10 +10,13 @@
 #include <rte_pci.h>
 #include <rte_debug.h>
 #include <rte_atomic.h>
+#include <rte_rwlock.h>
 #include <rte_log.h>
 #include <rte_kvargs.h>
 #include <rte_devargs.h>
 #include <rte_bitops.h>
+#include <rte_lcore.h>
+#include <rte_spinlock.h>
 #include <rte_os_shim.h>
 
 #include "mlx5_prm.h"
@@ -22,6 +25,7 @@
 
 /* Reported driver name. */
 #define MLX5_PCI_DRIVER_NAME "mlx5_pci"
+#define MLX5_AUXILIARY_DRIVER_NAME "mlx5_auxiliary"
 
 /* Bit-field manipulation. */
 #define BITFIELD_DECLARE(bf, type, size) \
@@ -107,6 +111,7 @@ pmd_drv_log_basename(const char *s)
 	int mkstr_size_##name = snprintf(NULL, 0, "" __VA_ARGS__); \
 	char name[mkstr_size_##name + 1]; \
 	\
+	memset(name, 0, mkstr_size_##name + 1); \
 	snprintf(name, sizeof(name), "" __VA_ARGS__)
 
 enum {
@@ -202,18 +207,62 @@ check_cqe(volatile struct mlx5_cqe *cqe, const uint16_t cqes_n,
 	return MLX5_CQE_STATUS_SW_OWN;
 }
 
+/*
+ * Get PCI address <DBDF> string from EAL device.
+ *
+ * @param[out] addr
+ *	The output address buffer string
+ * @param[in] size
+ *	The output buffer size
+ * @return
+ *   - 0 on success.
+ *   - Negative value and rte_errno is set otherwise.
+ */
 __rte_internal
-int mlx5_dev_to_pci_addr(const char *dev_path, struct rte_pci_addr *pci_addr);
+int mlx5_dev_to_pci_str(const struct rte_device *dev, char *addr, size_t size);
+
+/*
+ * Get PCI address from sysfs of a PCI-related device.
+ *
+ * @param[in] dev_path
+ *   The sysfs path should not point to the direct plain PCI device.
+ *   Instead, the node "/device/" is used to access the real device.
+ * @param[out] pci_addr
+ *   Parsed PCI address.
+ *
+ * @return
+ *   - 0 on success.
+ *   - Negative value and rte_errno is set otherwise.
+ */
+__rte_internal
+int mlx5_get_pci_addr(const char *dev_path, struct rte_pci_addr *pci_addr);
+
+/*
+ * Get kernel network interface name from sysfs IB device path.
+ *
+ * @param[in] ibdev_path
+ *   The sysfs path to IB device.
+ * @param[out] ifname
+ *   Interface name output of size IF_NAMESIZE.
+ *
+ * @return
+ *   - 0 on success.
+ *   - Negative value and rte_errno is set otherwise.
+ */
 __rte_internal
 int mlx5_get_ifname_sysfs(const char *ibdev_path, char *ifname);
 
+__rte_internal
+int mlx5_auxiliary_get_child_name(const char *dev, const char *node,
+				  char *child, size_t size);
 
 enum mlx5_class {
 	MLX5_CLASS_INVALID,
-	MLX5_CLASS_NET = RTE_BIT64(0),
+	MLX5_CLASS_ETH = RTE_BIT64(0),
 	MLX5_CLASS_VDPA = RTE_BIT64(1),
 	MLX5_CLASS_REGEX = RTE_BIT64(2),
 	MLX5_CLASS_COMPRESS = RTE_BIT64(3),
+	MLX5_CLASS_CRYPTO = RTE_BIT64(4),
 };
 
 #define MLX5_DBR_SIZE RTE_CACHE_LINE_SIZE
@@ -241,5 +290,133 @@ extern uint8_t haswell_broadwell_cpu;
 
 __rte_internal
 void mlx5_common_init(void);
+
+/*
+ * Common Driver Interface
+ *
+ * ConnectX common driver supports multiple classes: net, vDPA, regex, crypto
+ * and compress devices. This layer enables creating such multiple classes
+ * on a single device by allowing to bind multiple class-specific device
+ * drivers to attach to the common driver.
+ *
+ * ------------  -------------  --------------  -----------------  ------------
+ * | mlx5 net |  | mlx5 vdpa |  | mlx5 regex |  | mlx5 compress |  | mlx5 ... |
+ * |  driver  |  |  driver   |  |   driver   |  |     driver    |  |  drivers |
+ * ------------  -------------  --------------  -----------------  ------------
+ *                               ||
+ *                        -----------------
+ *                        |     mlx5      |
+ *                        | common driver |
+ *                        -----------------
+ *                          |          |
+ *                 -----------        -----------------
+ *                 |   mlx5  |        |   mlx5        |
+ *                 | pci dev |        | auxiliary dev |
+ *                 -----------        -----------------
+ *
+ * - mlx5 PCI bus driver binds to mlx5 PCI devices defined by PCI ID table
+ *   of all related devices.
+ * - mlx5 class driver such as net, vDPA, regex defines its specific
+ *   PCI ID table and mlx5 bus driver probes matching class drivers.
+ * - mlx5 common driver is central place that validates supported
+ *   class combinations.
+ * - mlx5 common driver hides bus difference by resolving device address
+ *   from devargs, locating target RDMA device and probing with it.
+ */
+
+/**
+ * Initialization function for the driver called during device probing.
+ */
+typedef int (mlx5_class_driver_probe_t)(struct rte_device *dev);
+
+/**
+ * Uninitialization function for the driver called during hot-unplugging.
+ */
+typedef int (mlx5_class_driver_remove_t)(struct rte_device *dev);
+
+/**
+ * Driver-specific DMA mapping. After a successful call the device
+ * will be able to read/write from/to this segment.
+ *
+ * @param dev
+ *   Pointer to the device.
+ * @param addr
+ *   Starting virtual address of memory to be mapped.
+ * @param iova
+ *   Starting IOVA address of memory to be mapped.
+ * @param len
+ *   Length of memory segment being mapped.
+ * @return
+ *   - 0 On success.
+ *   - Negative value and rte_errno is set otherwise.
+ */
+typedef int (mlx5_class_driver_dma_map_t)(struct rte_device *dev, void *addr,
+					  uint64_t iova, size_t len);
+
+/**
+ * Driver-specific DMA un-mapping. After a successful call the device
+ * will not be able to read/write from/to this segment.
+ *
+ * @param dev
+ *   Pointer to the device.
+ * @param addr
+ *   Starting virtual address of memory to be unmapped.
+ * @param iova
+ *   Starting IOVA address of memory to be unmapped.
+ * @param len
+ *   Length of memory segment being unmapped.
+ * @return
+ *   - 0 On success.
+ *   - Negative value and rte_errno is set otherwise.
+ */
+typedef int (mlx5_class_driver_dma_unmap_t)(struct rte_device *dev, void *addr,
+					    uint64_t iova, size_t len);
+
+/** Device already probed can be probed again to check for new ports. */
+#define MLX5_DRV_PROBE_AGAIN 0x0004
+
+/**
+ * A structure describing a mlx5 common class driver.
+ */
+struct mlx5_class_driver {
+	TAILQ_ENTRY(mlx5_class_driver) next;
+	enum mlx5_class drv_class;            /**< Class of this driver. */
+	const char *name;                     /**< Driver name. */
+	mlx5_class_driver_probe_t *probe;     /**< Device probe function. */
+	mlx5_class_driver_remove_t *remove;   /**< Device remove function. */
+	mlx5_class_driver_dma_map_t *dma_map; /**< Device DMA map function. */
+	mlx5_class_driver_dma_unmap_t *dma_unmap;
+	/**< Device DMA unmap function. */
+	const struct rte_pci_id *id_table;    /**< ID table, NULL terminated. */
+	uint32_t probe_again:1;
+	/**< Device already probed can be probed again to check new device. */
+	uint32_t intr_lsc:1; /**< Supports link state interrupt. */
+	uint32_t intr_rmv:1; /**< Supports device remove interrupt. */
+};
+
+/**
+ * Register a mlx5 device driver.
+ *
+ * @param driver
+ *   A pointer to a mlx5_driver structure describing the driver
+ *   to be registered.
+ */
+__rte_internal
+void
+mlx5_class_driver_register(struct mlx5_class_driver *driver);
+
+/**
+ * Test device is a PCI bus device.
+ *
+ * @param dev
+ *   Pointer to device.
+ *
+ * @return
+ *   - True on device devargs is a PCI bus device.
+ *   - False otherwise.
+ */
+__rte_internal
+bool
+mlx5_dev_is_pci(const struct rte_device *dev);
 
 #endif /* RTE_PMD_MLX5_COMMON_H_ */

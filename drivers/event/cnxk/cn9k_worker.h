@@ -5,8 +5,13 @@
 #ifndef __CN9K_WORKER_H__
 #define __CN9K_WORKER_H__
 
+#include "cnxk_ethdev.h"
 #include "cnxk_eventdev.h"
 #include "cnxk_worker.h"
+
+#include "cn9k_ethdev.h"
+#include "cn9k_rx.h"
+#include "cn9k_tx.h"
 
 /* SSO Operations */
 
@@ -124,17 +129,36 @@ cn9k_sso_hws_dual_forward_event(struct cn9k_sso_hws_dual *dws,
 	}
 }
 
+static __rte_always_inline void
+cn9k_wqe_to_mbuf(uint64_t wqe, const uint64_t mbuf, uint8_t port_id,
+		 const uint32_t tag, const uint32_t flags,
+		 const void *const lookup_mem)
+{
+	const uint64_t mbuf_init = 0x100010000ULL | RTE_PKTMBUF_HEADROOM |
+				   (flags & NIX_RX_OFFLOAD_TSTAMP_F ? 8 : 0);
+
+	cn9k_nix_cqe_to_mbuf((struct nix_cqe_hdr_s *)wqe, tag,
+			     (struct rte_mbuf *)mbuf, lookup_mem,
+			     mbuf_init | ((uint64_t)port_id) << 48, flags);
+}
+
 static __rte_always_inline uint16_t
 cn9k_sso_hws_dual_get_work(struct cn9k_sso_hws_state *ws,
 			   struct cn9k_sso_hws_state *ws_pair,
-			   struct rte_event *ev)
+			   struct rte_event *ev, const uint32_t flags,
+			   const void *const lookup_mem,
+			   struct cnxk_timesync_info *const tstamp)
 {
 	const uint64_t set_gw = BIT_ULL(16) | 1;
 	union {
 		__uint128_t get_work;
 		uint64_t u64[2];
 	} gw;
+	uint64_t tstamp_ptr;
+	uint64_t mbuf;
 
+	if (flags & NIX_RX_OFFLOAD_PTYPE_F)
+		rte_prefetch_non_temporal(lookup_mem);
 #ifdef RTE_ARCH_ARM64
 	asm volatile(PLT_CPU_FEATURE_PREAMBLE
 		     "rty%=:					\n"
@@ -143,7 +167,10 @@ cn9k_sso_hws_dual_get_work(struct cn9k_sso_hws_state *ws,
 		     "		tbnz %[tag], 63, rty%=		\n"
 		     "done%=:	str %[gw], [%[pong]]		\n"
 		     "		dmb ld				\n"
-		     : [tag] "=&r"(gw.u64[0]), [wqp] "=&r"(gw.u64[1])
+		     "		sub %[mbuf], %[wqp], #0x80	\n"
+		     "		prfm pldl1keep, [%[mbuf]]	\n"
+		     : [tag] "=&r"(gw.u64[0]), [wqp] "=&r"(gw.u64[1]),
+		       [mbuf] "=&r"(mbuf)
 		     : [tag_loc] "r"(ws->tag_op), [wqp_loc] "r"(ws->wqp_op),
 		       [gw] "r"(set_gw), [pong] "r"(ws_pair->getwrk_op));
 #else
@@ -152,11 +179,33 @@ cn9k_sso_hws_dual_get_work(struct cn9k_sso_hws_state *ws,
 		gw.u64[0] = plt_read64(ws->tag_op);
 	gw.u64[1] = plt_read64(ws->wqp_op);
 	plt_write64(set_gw, ws_pair->getwrk_op);
+	mbuf = (uint64_t)((char *)gw.u64[1] - sizeof(struct rte_mbuf));
 #endif
 
 	gw.u64[0] = (gw.u64[0] & (0x3ull << 32)) << 6 |
 		    (gw.u64[0] & (0x3FFull << 36)) << 4 |
 		    (gw.u64[0] & 0xffffffff);
+
+	if (CNXK_TT_FROM_EVENT(gw.u64[0]) != SSO_TT_EMPTY) {
+		if (CNXK_EVENT_TYPE_FROM_TAG(gw.u64[0]) ==
+		    RTE_EVENT_TYPE_ETHDEV) {
+			uint8_t port = CNXK_SUB_EVENT_FROM_TAG(gw.u64[0]);
+
+			gw.u64[0] = CNXK_CLR_SUB_EVENT(gw.u64[0]);
+			cn9k_wqe_to_mbuf(gw.u64[1], mbuf, port,
+					 gw.u64[0] & 0xFFFFF, flags,
+					 lookup_mem);
+			/* Extracting tstamp, if PTP enabled*/
+			tstamp_ptr = *(uint64_t *)(((struct nix_wqe_hdr_s *)
+							    gw.u64[1]) +
+						   CNXK_SSO_WQE_SG_PTR);
+			cnxk_nix_mbuf_to_tstamp((struct rte_mbuf *)mbuf, tstamp,
+						flags & NIX_RX_OFFLOAD_TSTAMP_F,
+						flags & NIX_RX_MULTI_SEG_F,
+						(uint64_t *)tstamp_ptr);
+			gw.u64[1] = mbuf;
+		}
+	}
 
 	ev->event = gw.u64[0];
 	ev->u64 = gw.u64[1];
@@ -165,16 +214,22 @@ cn9k_sso_hws_dual_get_work(struct cn9k_sso_hws_state *ws,
 }
 
 static __rte_always_inline uint16_t
-cn9k_sso_hws_get_work(struct cn9k_sso_hws *ws, struct rte_event *ev)
+cn9k_sso_hws_get_work(struct cn9k_sso_hws *ws, struct rte_event *ev,
+		      const uint32_t flags, const void *const lookup_mem)
 {
 	union {
 		__uint128_t get_work;
 		uint64_t u64[2];
 	} gw;
+	uint64_t tstamp_ptr;
+	uint64_t mbuf;
 
 	plt_write64(BIT_ULL(16) | /* wait for work. */
 			    1,	  /* Use Mask set 0. */
 		    ws->getwrk_op);
+
+	if (flags & NIX_RX_OFFLOAD_PTYPE_F)
+		rte_prefetch_non_temporal(lookup_mem);
 #ifdef RTE_ARCH_ARM64
 	asm volatile(PLT_CPU_FEATURE_PREAMBLE
 		     "		ldr %[tag], [%[tag_loc]]	\n"
@@ -186,7 +241,10 @@ cn9k_sso_hws_get_work(struct cn9k_sso_hws *ws, struct rte_event *ev)
 		     "		ldr %[wqp], [%[wqp_loc]]	\n"
 		     "		tbnz %[tag], 63, rty%=		\n"
 		     "done%=:	dmb ld				\n"
-		     : [tag] "=&r"(gw.u64[0]), [wqp] "=&r"(gw.u64[1])
+		     "		sub %[mbuf], %[wqp], #0x80	\n"
+		     "		prfm pldl1keep, [%[mbuf]]	\n"
+		     : [tag] "=&r"(gw.u64[0]), [wqp] "=&r"(gw.u64[1]),
+		       [mbuf] "=&r"(mbuf)
 		     : [tag_loc] "r"(ws->tag_op), [wqp_loc] "r"(ws->wqp_op));
 #else
 	gw.u64[0] = plt_read64(ws->tag_op);
@@ -194,11 +252,34 @@ cn9k_sso_hws_get_work(struct cn9k_sso_hws *ws, struct rte_event *ev)
 		gw.u64[0] = plt_read64(ws->tag_op);
 
 	gw.u64[1] = plt_read64(ws->wqp_op);
+	mbuf = (uint64_t)((char *)gw.u64[1] - sizeof(struct rte_mbuf));
 #endif
 
 	gw.u64[0] = (gw.u64[0] & (0x3ull << 32)) << 6 |
 		    (gw.u64[0] & (0x3FFull << 36)) << 4 |
 		    (gw.u64[0] & 0xffffffff);
+
+	if (CNXK_TT_FROM_EVENT(gw.u64[0]) != SSO_TT_EMPTY) {
+		if (CNXK_EVENT_TYPE_FROM_TAG(gw.u64[0]) ==
+		    RTE_EVENT_TYPE_ETHDEV) {
+			uint8_t port = CNXK_SUB_EVENT_FROM_TAG(gw.u64[0]);
+
+			gw.u64[0] = CNXK_CLR_SUB_EVENT(gw.u64[0]);
+			cn9k_wqe_to_mbuf(gw.u64[1], mbuf, port,
+					 gw.u64[0] & 0xFFFFF, flags,
+					 lookup_mem);
+			/* Extracting tstamp, if PTP enabled*/
+			tstamp_ptr = *(uint64_t *)(((struct nix_wqe_hdr_s *)
+							    gw.u64[1]) +
+						   CNXK_SSO_WQE_SG_PTR);
+			cnxk_nix_mbuf_to_tstamp((struct rte_mbuf *)mbuf,
+						ws->tstamp,
+						flags & NIX_RX_OFFLOAD_TSTAMP_F,
+						flags & NIX_RX_MULTI_SEG_F,
+						(uint64_t *)tstamp_ptr);
+			gw.u64[1] = mbuf;
+		}
+	}
 
 	ev->event = gw.u64[0];
 	ev->u64 = gw.u64[1];
@@ -214,6 +295,7 @@ cn9k_sso_hws_get_work_empty(struct cn9k_sso_hws_state *ws, struct rte_event *ev)
 		__uint128_t get_work;
 		uint64_t u64[2];
 	} gw;
+	uint64_t mbuf;
 
 #ifdef RTE_ARCH_ARM64
 	asm volatile(PLT_CPU_FEATURE_PREAMBLE
@@ -226,7 +308,9 @@ cn9k_sso_hws_get_work_empty(struct cn9k_sso_hws_state *ws, struct rte_event *ev)
 		     "		ldr %[wqp], [%[wqp_loc]]	\n"
 		     "		tbnz %[tag], 63, rty%=		\n"
 		     "done%=:	dmb ld				\n"
-		     : [tag] "=&r"(gw.u64[0]), [wqp] "=&r"(gw.u64[1])
+		     "		sub %[mbuf], %[wqp], #0x80	\n"
+		     : [tag] "=&r"(gw.u64[0]), [wqp] "=&r"(gw.u64[1]),
+		       [mbuf] "=&r"(mbuf)
 		     : [tag_loc] "r"(ws->tag_op), [wqp_loc] "r"(ws->wqp_op));
 #else
 	gw.u64[0] = plt_read64(ws->tag_op);
@@ -234,11 +318,24 @@ cn9k_sso_hws_get_work_empty(struct cn9k_sso_hws_state *ws, struct rte_event *ev)
 		gw.u64[0] = plt_read64(ws->tag_op);
 
 	gw.u64[1] = plt_read64(ws->wqp_op);
+	mbuf = (uint64_t)((char *)gw.u64[1] - sizeof(struct rte_mbuf));
 #endif
 
 	gw.u64[0] = (gw.u64[0] & (0x3ull << 32)) << 6 |
 		    (gw.u64[0] & (0x3FFull << 36)) << 4 |
 		    (gw.u64[0] & 0xffffffff);
+
+	if (CNXK_TT_FROM_EVENT(gw.u64[0]) != SSO_TT_EMPTY) {
+		if (CNXK_EVENT_TYPE_FROM_TAG(gw.u64[0]) ==
+		    RTE_EVENT_TYPE_ETHDEV) {
+			uint8_t port = CNXK_SUB_EVENT_FROM_TAG(gw.u64[0]);
+
+			gw.u64[0] = CNXK_CLR_SUB_EVENT(gw.u64[0]);
+			cn9k_wqe_to_mbuf(gw.u64[1], mbuf, port,
+					 gw.u64[0] & 0xFFFFF, 0, NULL);
+			gw.u64[1] = mbuf;
+		}
+	}
 
 	ev->event = gw.u64[0];
 	ev->u64 = gw.u64[1];
@@ -270,28 +367,151 @@ uint16_t __rte_hot cn9k_sso_hws_dual_enq_fwd_burst(void *port,
 						   const struct rte_event ev[],
 						   uint16_t nb_events);
 
-uint16_t __rte_hot cn9k_sso_hws_deq(void *port, struct rte_event *ev,
-				    uint64_t timeout_ticks);
-uint16_t __rte_hot cn9k_sso_hws_deq_burst(void *port, struct rte_event ev[],
-					  uint16_t nb_events,
-					  uint64_t timeout_ticks);
-uint16_t __rte_hot cn9k_sso_hws_tmo_deq(void *port, struct rte_event *ev,
-					uint64_t timeout_ticks);
-uint16_t __rte_hot cn9k_sso_hws_tmo_deq_burst(void *port, struct rte_event ev[],
-					      uint16_t nb_events,
-					      uint64_t timeout_ticks);
+#define R(name, f5, f4, f3, f2, f1, f0, flags)                                 \
+	uint16_t __rte_hot cn9k_sso_hws_deq_##name(                            \
+		void *port, struct rte_event *ev, uint64_t timeout_ticks);     \
+	uint16_t __rte_hot cn9k_sso_hws_deq_burst_##name(                      \
+		void *port, struct rte_event ev[], uint16_t nb_events,         \
+		uint64_t timeout_ticks);                                       \
+	uint16_t __rte_hot cn9k_sso_hws_deq_tmo_##name(                        \
+		void *port, struct rte_event *ev, uint64_t timeout_ticks);     \
+	uint16_t __rte_hot cn9k_sso_hws_deq_tmo_burst_##name(                  \
+		void *port, struct rte_event ev[], uint16_t nb_events,         \
+		uint64_t timeout_ticks);                                       \
+	uint16_t __rte_hot cn9k_sso_hws_deq_seg_##name(                        \
+		void *port, struct rte_event *ev, uint64_t timeout_ticks);     \
+	uint16_t __rte_hot cn9k_sso_hws_deq_seg_burst_##name(                  \
+		void *port, struct rte_event ev[], uint16_t nb_events,         \
+		uint64_t timeout_ticks);                                       \
+	uint16_t __rte_hot cn9k_sso_hws_deq_tmo_seg_##name(                    \
+		void *port, struct rte_event *ev, uint64_t timeout_ticks);     \
+	uint16_t __rte_hot cn9k_sso_hws_deq_tmo_seg_burst_##name(              \
+		void *port, struct rte_event ev[], uint16_t nb_events,         \
+		uint64_t timeout_ticks);
 
-uint16_t __rte_hot cn9k_sso_hws_dual_deq(void *port, struct rte_event *ev,
-					 uint64_t timeout_ticks);
-uint16_t __rte_hot cn9k_sso_hws_dual_deq_burst(void *port,
-					       struct rte_event ev[],
-					       uint16_t nb_events,
-					       uint64_t timeout_ticks);
-uint16_t __rte_hot cn9k_sso_hws_dual_tmo_deq(void *port, struct rte_event *ev,
-					     uint64_t timeout_ticks);
-uint16_t __rte_hot cn9k_sso_hws_dual_tmo_deq_burst(void *port,
-						   struct rte_event ev[],
-						   uint16_t nb_events,
-						   uint64_t timeout_ticks);
+NIX_RX_FASTPATH_MODES
+#undef R
+
+#define R(name, f5, f4, f3, f2, f1, f0, flags)                                 \
+	uint16_t __rte_hot cn9k_sso_hws_dual_deq_##name(                       \
+		void *port, struct rte_event *ev, uint64_t timeout_ticks);     \
+	uint16_t __rte_hot cn9k_sso_hws_dual_deq_burst_##name(                 \
+		void *port, struct rte_event ev[], uint16_t nb_events,         \
+		uint64_t timeout_ticks);                                       \
+	uint16_t __rte_hot cn9k_sso_hws_dual_deq_tmo_##name(                   \
+		void *port, struct rte_event *ev, uint64_t timeout_ticks);     \
+	uint16_t __rte_hot cn9k_sso_hws_dual_deq_tmo_burst_##name(             \
+		void *port, struct rte_event ev[], uint16_t nb_events,         \
+		uint64_t timeout_ticks);                                       \
+	uint16_t __rte_hot cn9k_sso_hws_dual_deq_seg_##name(                   \
+		void *port, struct rte_event *ev, uint64_t timeout_ticks);     \
+	uint16_t __rte_hot cn9k_sso_hws_dual_deq_seg_burst_##name(             \
+		void *port, struct rte_event ev[], uint16_t nb_events,         \
+		uint64_t timeout_ticks);                                       \
+	uint16_t __rte_hot cn9k_sso_hws_dual_deq_tmo_seg_##name(               \
+		void *port, struct rte_event *ev, uint64_t timeout_ticks);     \
+	uint16_t __rte_hot cn9k_sso_hws_dual_deq_tmo_seg_burst_##name(         \
+		void *port, struct rte_event ev[], uint16_t nb_events,         \
+		uint64_t timeout_ticks);
+
+NIX_RX_FASTPATH_MODES
+#undef R
+
+static __rte_always_inline void
+cn9k_sso_txq_fc_wait(const struct cn9k_eth_txq *txq)
+{
+	while (!((txq->nb_sqb_bufs_adj -
+		  __atomic_load_n(txq->fc_mem, __ATOMIC_RELAXED))
+		 << (txq)->sqes_per_sqb_log2))
+		;
+}
+
+static __rte_always_inline const struct cn9k_eth_txq *
+cn9k_sso_hws_xtract_meta(struct rte_mbuf *m,
+			 const uint64_t txq_data[][RTE_MAX_QUEUES_PER_PORT])
+{
+	return (const struct cn9k_eth_txq *)
+		txq_data[m->port][rte_event_eth_tx_adapter_txq_get(m)];
+}
+
+static __rte_always_inline void
+cn9k_sso_hws_prepare_pkt(const struct cn9k_eth_txq *txq, struct rte_mbuf *m,
+			 uint64_t *cmd, const uint32_t flags)
+{
+	roc_lmt_mov(cmd, txq->cmd, cn9k_nix_tx_ext_subs(flags));
+	cn9k_nix_xmit_prepare(m, cmd, flags, txq->lso_tun_fmt);
+}
+
+static __rte_always_inline uint16_t
+cn9k_sso_hws_event_tx(uint64_t base, struct rte_event *ev, uint64_t *cmd,
+		      const uint64_t txq_data[][RTE_MAX_QUEUES_PER_PORT],
+		      const uint32_t flags)
+{
+	struct rte_mbuf *m = ev->mbuf;
+	const struct cn9k_eth_txq *txq;
+	uint16_t ref_cnt = m->refcnt;
+
+	/* Perform header writes before barrier for TSO */
+	cn9k_nix_xmit_prepare_tso(m, flags);
+	/* Lets commit any changes in the packet here in case when
+	 * fast free is set as no further changes will be made to mbuf.
+	 * In case of fast free is not set, both cn9k_nix_prepare_mseg()
+	 * and cn9k_nix_xmit_prepare() has a barrier after refcnt update.
+	 */
+	if (!(flags & NIX_TX_OFFLOAD_MBUF_NOFF_F))
+		rte_io_wmb();
+	txq = cn9k_sso_hws_xtract_meta(m, txq_data);
+	cn9k_sso_hws_prepare_pkt(txq, m, cmd, flags);
+
+	if (flags & NIX_TX_MULTI_SEG_F) {
+		const uint16_t segdw = cn9k_nix_prepare_mseg(m, cmd, flags);
+		if (!CNXK_TT_FROM_EVENT(ev->event)) {
+			cn9k_nix_xmit_mseg_prep_lmt(cmd, txq->lmt_addr, segdw);
+			roc_sso_hws_head_wait(base + SSOW_LF_GWS_TAG);
+			cn9k_sso_txq_fc_wait(txq);
+			if (cn9k_nix_xmit_submit_lmt(txq->io_addr) == 0)
+				cn9k_nix_xmit_mseg_one(cmd, txq->lmt_addr,
+						       txq->io_addr, segdw);
+		} else {
+			cn9k_nix_xmit_mseg_one(cmd, txq->lmt_addr, txq->io_addr,
+					       segdw);
+		}
+	} else {
+		if (!CNXK_TT_FROM_EVENT(ev->event)) {
+			cn9k_nix_xmit_prep_lmt(cmd, txq->lmt_addr, flags);
+			roc_sso_hws_head_wait(base + SSOW_LF_GWS_TAG);
+			cn9k_sso_txq_fc_wait(txq);
+			if (cn9k_nix_xmit_submit_lmt(txq->io_addr) == 0)
+				cn9k_nix_xmit_one(cmd, txq->lmt_addr,
+						  txq->io_addr, flags);
+		} else {
+			cn9k_nix_xmit_one(cmd, txq->lmt_addr, txq->io_addr,
+					  flags);
+		}
+	}
+
+	if (flags & NIX_TX_OFFLOAD_MBUF_NOFF_F) {
+		if (ref_cnt > 1)
+			return 1;
+	}
+
+	cnxk_sso_hws_swtag_flush(base + SSOW_LF_GWS_TAG,
+				 base + SSOW_LF_GWS_OP_SWTAG_FLUSH);
+
+	return 1;
+}
+
+#define T(name, f5, f4, f3, f2, f1, f0, sz, flags)                             \
+	uint16_t __rte_hot cn9k_sso_hws_tx_adptr_enq_##name(                   \
+		void *port, struct rte_event ev[], uint16_t nb_events);        \
+	uint16_t __rte_hot cn9k_sso_hws_tx_adptr_enq_seg_##name(               \
+		void *port, struct rte_event ev[], uint16_t nb_events);        \
+	uint16_t __rte_hot cn9k_sso_hws_dual_tx_adptr_enq_##name(              \
+		void *port, struct rte_event ev[], uint16_t nb_events);        \
+	uint16_t __rte_hot cn9k_sso_hws_dual_tx_adptr_enq_seg_##name(          \
+		void *port, struct rte_event ev[], uint16_t nb_events);
+
+NIX_TX_FASTPATH_MODES
+#undef T
 
 #endif

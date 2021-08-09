@@ -24,6 +24,8 @@ INTERNAL {
 	roc_ae_fpm_put;
 	roc_bphy_cgx_dev_fini;
 	roc_bphy_cgx_dev_init;
+	roc_bphy_cgx_fec_set;
+	roc_bphy_cgx_fec_supported_get;
 	roc_bphy_cgx_get_linkinfo;
 	roc_bphy_cgx_intlbk_disable;
 	roc_bphy_cgx_intlbk_enable;
@@ -54,6 +56,7 @@ INTERNAL {
 	roc_cpt_inline_ipsec_cfg;
 	roc_cpt_inline_ipsec_inb_cfg;
 	roc_cpt_iq_disable;
+	roc_cpt_iq_enable;
 	roc_cpt_lf_ctx_flush;
 	roc_cpt_lf_init;
 	roc_cpt_lf_fini;
@@ -83,6 +86,7 @@ INTERNAL {
 	roc_nix_fc_config_set;
 	roc_nix_fc_mode_set;
 	roc_nix_fc_mode_get;
+	rox_nix_fc_npa_bp_cfg;
 	roc_nix_get_base_chan;
 	roc_nix_get_pf;
 	roc_nix_get_pf_func;

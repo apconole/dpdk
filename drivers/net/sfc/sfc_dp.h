@@ -42,6 +42,16 @@ enum sfc_dp_type {
 
 /** Datapath queue run-time information */
 struct sfc_dp_queue {
+	/*
+	 * Typically the structure is located at the end of Rx/Tx queue
+	 * data structure and not used on datapath. So, it is not a
+	 * problem to have extra fields even if not used. However,
+	 * put stats at top of the structure to be closer to fields
+	 * used on datapath or reap to have more chances to be cache-hot.
+	 */
+	uint32_t			rx_dbells;
+	uint32_t			tx_dbells;
+
 	uint16_t			port_id;
 	uint16_t			queue_id;
 	struct rte_pci_addr		pci_addr;
@@ -95,6 +105,12 @@ struct sfc_dp {
 
 /** List of datapath variants */
 TAILQ_HEAD(sfc_dp_list, sfc_dp);
+
+typedef unsigned int sfc_sw_index_t;
+#define SFC_SW_INDEX_INVALID	((sfc_sw_index_t)(UINT_MAX))
+
+typedef int32_t	sfc_ethdev_qid_t;
+#define SFC_ETHDEV_QID_INVALID	((sfc_ethdev_qid_t)(-1))
 
 /* Check if available HW/FW capabilities are sufficient for the datapath */
 static inline bool

@@ -23,20 +23,8 @@
 const struct mlx5_glue *mlx5_glue;
 #endif
 
-/**
- * Get PCI information by sysfs device path.
- *
- * @param dev_path
- *   Pointer to device sysfs folder name.
- * @param[out] pci_addr
- *   PCI bus address output buffer.
- *
- * @return
- *   0 on success, a negative errno value otherwise and rte_errno is set.
- */
 int
-mlx5_dev_to_pci_addr(const char *dev_path,
-		     struct rte_pci_addr *pci_addr)
+mlx5_get_pci_addr(const char *dev_path, struct rte_pci_addr *pci_addr)
 {
 	FILE *file;
 	char line[32];
@@ -159,17 +147,6 @@ mlx5_translate_port_name(const char *port_name_in,
 	port_info_out->name_type = MLX5_PHYS_PORT_NAME_TYPE_UNKNOWN;
 }
 
-/**
- * Get kernel interface name from IB device path.
- *
- * @param[in] ibdev_path
- *   Pointer to IB device path.
- * @param[out] ifname
- *   Interface name output buffer.
- *
- * @return
- *   0 on success, a negative errno value otherwise and rte_errno is set.
- */
 int
 mlx5_get_ifname_sysfs(const char *ibdev_path, char *ifname)
 {
@@ -425,7 +402,7 @@ glue_error:
 }
 
 struct ibv_device *
-mlx5_os_get_ibv_device(struct rte_pci_addr *addr)
+mlx5_os_get_ibv_device(const struct rte_pci_addr *addr)
 {
 	int n;
 	struct ibv_device **ibv_list = mlx5_glue->get_device_list(&n);
@@ -439,7 +416,7 @@ mlx5_os_get_ibv_device(struct rte_pci_addr *addr)
 		struct rte_pci_addr paddr;
 
 		DRV_LOG(DEBUG, "Checking device \"%s\"..", ibv_list[n]->name);
-		if (mlx5_dev_to_pci_addr(ibv_list[n]->ibdev_path, &paddr) != 0)
+		if (mlx5_get_pci_addr(ibv_list[n]->ibdev_path, &paddr) != 0)
 			continue;
 		if (rte_pci_addr_cmp(addr, &paddr) != 0)
 			continue;

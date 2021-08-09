@@ -1085,7 +1085,8 @@ int bnxt_hwrm_func_driver_register(struct bnxt *bp)
 		rte_cpu_to_le_32(ASYNC_CMPL_EVENT_ID_DEFAULT_VNIC_CHANGE);
 
 	req.async_event_fwd[2] |=
-		rte_cpu_to_le_32(ASYNC_CMPL_EVENT_ID_ECHO_REQUEST);
+		rte_cpu_to_le_32(ASYNC_CMPL_EVENT_ID_ECHO_REQUEST |
+				 ASYNC_CMPL_EVENT_ID_ERROR_REPORT);
 
 	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
 
@@ -3340,7 +3341,7 @@ int bnxt_hwrm_func_qcfg(struct bnxt *bp, uint16_t *mtu)
 	}
 
 	if (mtu)
-		*mtu = rte_le_to_cpu_16(resp->mtu);
+		*mtu = rte_le_to_cpu_16(resp->admin_mtu);
 
 	switch (resp->port_partition_type) {
 	case HWRM_FUNC_QCFG_OUTPUT_PORT_PARTITION_TYPE_NPAR1_0:
@@ -3388,16 +3389,6 @@ int bnxt_hwrm_parent_pf_qcfg(struct bnxt *bp)
 	bp->parent->vnic = rte_le_to_cpu_16(resp->dflt_vnic_id);
 	bp->parent->fid = rte_le_to_cpu_16(resp->fid);
 	bp->parent->port_id = rte_le_to_cpu_16(resp->port_id);
-
-	/* FIXME: Temporary workaround - remove when firmware issue is fixed. */
-	if (bp->parent->vnic == 0) {
-		PMD_DRV_LOG(DEBUG, "parent VNIC unavailable.\n");
-		/* Use hard-coded values appropriate for current Wh+ fw. */
-		if (bp->parent->fid == 2)
-			bp->parent->vnic = 0x100;
-		else
-			bp->parent->vnic = 1;
-	}
 
 	HWRM_UNLOCK();
 
@@ -3468,7 +3459,8 @@ static int bnxt_hwrm_pf_func_cfg(struct bnxt *bp,
 	uint32_t enables;
 	int rc;
 
-	enables = HWRM_FUNC_CFG_INPUT_ENABLES_MTU |
+	enables = HWRM_FUNC_CFG_INPUT_ENABLES_ADMIN_MTU |
+		  HWRM_FUNC_CFG_INPUT_ENABLES_HOST_MTU |
 		  HWRM_FUNC_CFG_INPUT_ENABLES_MRU |
 		  HWRM_FUNC_CFG_INPUT_ENABLES_NUM_RSSCOS_CTXS |
 		  HWRM_FUNC_CFG_INPUT_ENABLES_NUM_STAT_CTXS |
@@ -3488,7 +3480,8 @@ static int bnxt_hwrm_pf_func_cfg(struct bnxt *bp,
 	}
 
 	req.flags = rte_cpu_to_le_32(bp->pf->func_cfg_flags);
-	req.mtu = rte_cpu_to_le_16(BNXT_MAX_MTU);
+	req.admin_mtu = rte_cpu_to_le_16(BNXT_MAX_MTU);
+	req.host_mtu = rte_cpu_to_le_16(bp->eth_dev->data->mtu);
 	req.mru = rte_cpu_to_le_16(BNXT_VNIC_MRU(bp->eth_dev->data->mtu));
 	req.num_rsscos_ctxs = rte_cpu_to_le_16(pf_resc->num_rsscos_ctxs);
 	req.num_stat_ctxs = rte_cpu_to_le_16(pf_resc->num_stat_ctxs);
@@ -3548,7 +3541,7 @@ bnxt_fill_vf_func_cfg_req_old(struct bnxt *bp,
 			      struct hwrm_func_cfg_input *req,
 			      int num_vfs)
 {
-	req->enables = rte_cpu_to_le_32(HWRM_FUNC_CFG_INPUT_ENABLES_MTU |
+	req->enables = rte_cpu_to_le_32(HWRM_FUNC_CFG_INPUT_ENABLES_ADMIN_MTU |
 			HWRM_FUNC_CFG_INPUT_ENABLES_MRU |
 			HWRM_FUNC_CFG_INPUT_ENABLES_NUM_RSSCOS_CTXS |
 			HWRM_FUNC_CFG_INPUT_ENABLES_NUM_STAT_CTXS |
@@ -3559,9 +3552,9 @@ bnxt_fill_vf_func_cfg_req_old(struct bnxt *bp,
 			HWRM_FUNC_CFG_INPUT_ENABLES_NUM_VNICS |
 			HWRM_FUNC_CFG_INPUT_ENABLES_NUM_HW_RING_GRPS);
 
-	req->mtu = rte_cpu_to_le_16(bp->eth_dev->data->mtu + RTE_ETHER_HDR_LEN +
-				    RTE_ETHER_CRC_LEN + VLAN_TAG_SIZE *
-				    BNXT_NUM_VLANS);
+	req->admin_mtu = rte_cpu_to_le_16(bp->eth_dev->data->mtu + RTE_ETHER_HDR_LEN +
+					  RTE_ETHER_CRC_LEN + VLAN_TAG_SIZE *
+					  BNXT_NUM_VLANS);
 	req->mru = rte_cpu_to_le_16(BNXT_VNIC_MRU(bp->eth_dev->data->mtu));
 	req->num_rsscos_ctxs = rte_cpu_to_le_16(bp->max_rsscos_ctx /
 						(num_vfs + 1));
@@ -6202,4 +6195,26 @@ void bnxt_free_hwrm_tx_ring(struct bnxt *bp, int queue_index)
 	bnxt_hwrm_stat_ctx_free(bp, cpr);
 
 	bnxt_free_cp_ring(bp, cpr);
+}
+
+int bnxt_hwrm_config_host_mtu(struct bnxt *bp)
+{
+	struct hwrm_func_cfg_input req = {0};
+	struct hwrm_func_cfg_output *resp = bp->hwrm_cmd_resp_addr;
+	int rc;
+
+	if (!BNXT_PF(bp))
+		return 0;
+
+	HWRM_PREP(&req, HWRM_FUNC_CFG, BNXT_USE_CHIMP_MB);
+
+	req.fid = rte_cpu_to_le_16(0xffff);
+	req.enables = rte_cpu_to_le_32(HWRM_FUNC_CFG_INPUT_ENABLES_HOST_MTU);
+	req.host_mtu = rte_cpu_to_le_16(bp->eth_dev->data->mtu);
+
+	rc = bnxt_hwrm_send_message(bp, &req, sizeof(req), BNXT_USE_CHIMP_MB);
+	HWRM_CHECK_RESULT();
+	HWRM_UNLOCK();
+
+	return rc;
 }

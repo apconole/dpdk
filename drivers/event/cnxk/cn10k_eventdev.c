@@ -6,18 +6,6 @@
 #include "cnxk_eventdev.h"
 #include "cnxk_worker.h"
 
-static void
-cn10k_init_hws_ops(struct cn10k_sso_hws *ws, uintptr_t base)
-{
-	ws->tag_wqe_op = base + SSOW_LF_GWS_WQE0;
-	ws->getwrk_op = base + SSOW_LF_GWS_OP_GET_WORK0;
-	ws->updt_wqe_op = base + SSOW_LF_GWS_OP_UPD_WQP_GRP1;
-	ws->swtag_norm_op = base + SSOW_LF_GWS_OP_SWTAG_NORM;
-	ws->swtag_untag_op = base + SSOW_LF_GWS_OP_SWTAG_UNTAG;
-	ws->swtag_flush_op = base + SSOW_LF_GWS_OP_SWTAG_FLUSH;
-	ws->swtag_desched_op = base + SSOW_LF_GWS_OP_SWTAG_DESCHED;
-}
-
 static uint32_t
 cn10k_sso_gw_mode_wdata(struct cnxk_sso_evdev *dev)
 {
@@ -56,7 +44,7 @@ cn10k_sso_init_hws_mem(void *arg, uint8_t port_id)
 	/* First cache line is reserved for cookie */
 	ws = (struct cn10k_sso_hws *)((uint8_t *)ws + RTE_CACHE_LINE_SIZE);
 	ws->base = roc_sso_hws_base_get(&dev->sso, port_id);
-	cn10k_init_hws_ops(ws, ws->base);
+	ws->tx_base = ws->base;
 	ws->hws_id = port_id;
 	ws->swtag_req = 0;
 	ws->gw_wdata = cn10k_sso_gw_mode_wdata(dev);
@@ -135,13 +123,14 @@ cn10k_sso_hws_flush_events(void *hws, uint8_t queue_id, uintptr_t base,
 	cq_ds_cnt &= 0x3FFF3FFF0000;
 
 	while (aq_cnt || cq_ds_cnt || ds_cnt) {
-		plt_write64(req, ws->getwrk_op);
+		plt_write64(req, ws->base + SSOW_LF_GWS_OP_GET_WORK0);
 		cn10k_sso_hws_get_work_empty(ws, &ev);
 		if (fn != NULL && ev.u64 != 0)
 			fn(arg, ev);
 		if (ev.sched_type != SSO_TT_EMPTY)
-			cnxk_sso_hws_swtag_flush(ws->tag_wqe_op,
-						 ws->swtag_flush_op);
+			cnxk_sso_hws_swtag_flush(
+				ws->base + SSOW_LF_GWS_WQE0,
+				ws->base + SSOW_LF_GWS_OP_SWTAG_FLUSH);
 		do {
 			val = plt_read64(ws->base + SSOW_LF_GWS_PENDSTATE);
 		} while (val & BIT_ULL(56));
@@ -205,9 +194,11 @@ cn10k_sso_hws_reset(void *arg, void *hws)
 
 	if (CNXK_TT_FROM_TAG(plt_read64(base + SSOW_LF_GWS_PRF_WQE0)) !=
 	    SSO_TT_EMPTY) {
-		plt_write64(BIT_ULL(16) | 1, ws->getwrk_op);
+		plt_write64(BIT_ULL(16) | 1,
+			    ws->base + SSOW_LF_GWS_OP_GET_WORK0);
 		do {
-			roc_load_pair(gw.u64[0], gw.u64[1], ws->tag_wqe_op);
+			roc_load_pair(gw.u64[0], gw.u64[1],
+				      ws->base + SSOW_LF_GWS_WQE0);
 		} while (gw.u64[0] & BIT_ULL(63));
 		pend_tt = CNXK_TT_FROM_TAG(plt_read64(base + SSOW_LF_GWS_WQE0));
 		if (pend_tt != SSO_TT_EMPTY) { /* Work was pending */
@@ -243,22 +234,217 @@ cn10k_sso_rsrc_init(void *arg, uint8_t hws, uint8_t hwgrp)
 	return roc_sso_rsrc_init(&dev->sso, hws, hwgrp);
 }
 
+static int
+cn10k_sso_updt_tx_adptr_data(const struct rte_eventdev *event_dev)
+{
+	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
+	int i;
+
+	if (dev->tx_adptr_data == NULL)
+		return 0;
+
+	for (i = 0; i < dev->nb_event_ports; i++) {
+		struct cn10k_sso_hws *ws = event_dev->data->ports[i];
+		void *ws_cookie;
+
+		ws_cookie = cnxk_sso_hws_get_cookie(ws);
+		ws_cookie = rte_realloc_socket(
+			ws_cookie,
+			sizeof(struct cnxk_sso_hws_cookie) +
+				sizeof(struct cn10k_sso_hws) +
+				(sizeof(uint64_t) * (dev->max_port_id + 1) *
+				 RTE_MAX_QUEUES_PER_PORT),
+			RTE_CACHE_LINE_SIZE, SOCKET_ID_ANY);
+		if (ws_cookie == NULL)
+			return -ENOMEM;
+		ws = RTE_PTR_ADD(ws_cookie, sizeof(struct cnxk_sso_hws_cookie));
+		memcpy(&ws->tx_adptr_data, dev->tx_adptr_data,
+		       sizeof(uint64_t) * (dev->max_port_id + 1) *
+			       RTE_MAX_QUEUES_PER_PORT);
+		event_dev->data->ports[i] = ws;
+	}
+
+	return 0;
+}
+
 static void
 cn10k_sso_fp_fns_set(struct rte_eventdev *event_dev)
 {
 	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
+	const event_dequeue_t sso_hws_deq[2][2][2][2][2][2] = {
+#define R(name, f5, f4, f3, f2, f1, f0, flags)                                 \
+	[f5][f4][f3][f2][f1][f0] = cn10k_sso_hws_deq_##name,
+		NIX_RX_FASTPATH_MODES
+#undef R
+	};
+
+	const event_dequeue_burst_t sso_hws_deq_burst[2][2][2][2][2][2] = {
+#define R(name, f5, f4, f3, f2, f1, f0, flags)                                 \
+	[f5][f4][f3][f2][f1][f0] = cn10k_sso_hws_deq_burst_##name,
+		NIX_RX_FASTPATH_MODES
+#undef R
+	};
+
+	const event_dequeue_t sso_hws_tmo_deq[2][2][2][2][2][2] = {
+#define R(name, f5, f4, f3, f2, f1, f0, flags)                                 \
+	[f5][f4][f3][f2][f1][f0] = cn10k_sso_hws_deq_tmo_##name,
+		NIX_RX_FASTPATH_MODES
+#undef R
+	};
+
+	const event_dequeue_burst_t sso_hws_tmo_deq_burst[2][2][2][2][2][2] = {
+#define R(name, f5, f4, f3, f2, f1, f0, flags)                                 \
+	[f5][f4][f3][f2][f1][f0] = cn10k_sso_hws_deq_tmo_burst_##name,
+		NIX_RX_FASTPATH_MODES
+#undef R
+	};
+
+	const event_dequeue_t sso_hws_deq_seg[2][2][2][2][2][2] = {
+#define R(name, f5, f4, f3, f2, f1, f0, flags)                                 \
+	[f5][f4][f3][f2][f1][f0] = cn10k_sso_hws_deq_seg_##name,
+		NIX_RX_FASTPATH_MODES
+#undef R
+	};
+
+	const event_dequeue_burst_t sso_hws_deq_seg_burst[2][2][2][2][2][2] = {
+#define R(name, f5, f4, f3, f2, f1, f0, flags)                                 \
+	[f5][f4][f3][f2][f1][f0] = cn10k_sso_hws_deq_seg_burst_##name,
+		NIX_RX_FASTPATH_MODES
+#undef R
+	};
+
+	const event_dequeue_t sso_hws_tmo_deq_seg[2][2][2][2][2][2] = {
+#define R(name, f5, f4, f3, f2, f1, f0, flags)                                 \
+	[f5][f4][f3][f2][f1][f0] = cn10k_sso_hws_deq_tmo_seg_##name,
+		NIX_RX_FASTPATH_MODES
+#undef R
+	};
+
+	const event_dequeue_burst_t
+		sso_hws_tmo_deq_seg_burst[2][2][2][2][2][2] = {
+#define R(name, f5, f4, f3, f2, f1, f0, flags)                                 \
+	[f5][f4][f3][f2][f1][f0] = cn10k_sso_hws_deq_tmo_seg_burst_##name,
+			NIX_RX_FASTPATH_MODES
+#undef R
+		};
+
+	/* Tx modes */
+	const event_tx_adapter_enqueue
+		sso_hws_tx_adptr_enq[2][2][2][2][2][2] = {
+#define T(name, f5, f4, f3, f2, f1, f0, sz, flags)                             \
+	[f5][f4][f3][f2][f1][f0] = cn10k_sso_hws_tx_adptr_enq_##name,
+			NIX_TX_FASTPATH_MODES
+#undef T
+		};
+
+	const event_tx_adapter_enqueue
+		sso_hws_tx_adptr_enq_seg[2][2][2][2][2][2] = {
+#define T(name, f5, f4, f3, f2, f1, f0, sz, flags)                             \
+	[f5][f4][f3][f2][f1][f0] = cn10k_sso_hws_tx_adptr_enq_seg_##name,
+			NIX_TX_FASTPATH_MODES
+#undef T
+		};
 
 	event_dev->enqueue = cn10k_sso_hws_enq;
 	event_dev->enqueue_burst = cn10k_sso_hws_enq_burst;
 	event_dev->enqueue_new_burst = cn10k_sso_hws_enq_new_burst;
 	event_dev->enqueue_forward_burst = cn10k_sso_hws_enq_fwd_burst;
-
-	event_dev->dequeue = cn10k_sso_hws_deq;
-	event_dev->dequeue_burst = cn10k_sso_hws_deq_burst;
-	if (dev->is_timeout_deq) {
-		event_dev->dequeue = cn10k_sso_hws_tmo_deq;
-		event_dev->dequeue_burst = cn10k_sso_hws_tmo_deq_burst;
+	if (dev->rx_offloads & NIX_RX_MULTI_SEG_F) {
+		event_dev->dequeue = sso_hws_deq_seg
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_VLAN_STRIP_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_TSTAMP_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_MARK_UPDATE_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_CHECKSUM_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_PTYPE_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_RSS_F)];
+		event_dev->dequeue_burst = sso_hws_deq_seg_burst
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_VLAN_STRIP_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_TSTAMP_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_MARK_UPDATE_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_CHECKSUM_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_PTYPE_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_RSS_F)];
+		if (dev->is_timeout_deq) {
+			event_dev->dequeue = sso_hws_tmo_deq_seg
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_VLAN_STRIP_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_TSTAMP_F)]
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_MARK_UPDATE_F)]
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_CHECKSUM_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_PTYPE_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_RSS_F)];
+			event_dev->dequeue_burst = sso_hws_tmo_deq_seg_burst
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_VLAN_STRIP_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_TSTAMP_F)]
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_MARK_UPDATE_F)]
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_CHECKSUM_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_PTYPE_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_RSS_F)];
+		}
+	} else {
+		event_dev->dequeue = sso_hws_deq
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_VLAN_STRIP_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_TSTAMP_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_MARK_UPDATE_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_CHECKSUM_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_PTYPE_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_RSS_F)];
+		event_dev->dequeue_burst = sso_hws_deq_burst
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_VLAN_STRIP_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_TSTAMP_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_MARK_UPDATE_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_CHECKSUM_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_PTYPE_F)]
+			[!!(dev->rx_offloads & NIX_RX_OFFLOAD_RSS_F)];
+		if (dev->is_timeout_deq) {
+			event_dev->dequeue = sso_hws_tmo_deq
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_VLAN_STRIP_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_TSTAMP_F)]
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_MARK_UPDATE_F)]
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_CHECKSUM_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_PTYPE_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_RSS_F)];
+			event_dev->dequeue_burst = sso_hws_tmo_deq_burst
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_VLAN_STRIP_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_TSTAMP_F)]
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_MARK_UPDATE_F)]
+				[!!(dev->rx_offloads &
+				    NIX_RX_OFFLOAD_CHECKSUM_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_PTYPE_F)]
+				[!!(dev->rx_offloads & NIX_RX_OFFLOAD_RSS_F)];
+		}
 	}
+
+	if (dev->tx_offloads & NIX_TX_MULTI_SEG_F) {
+		/* [SEC] [TSMP] [MBUF_NOFF] [VLAN] [OL3_L4_CSUM] [L3_L4_CSUM] */
+		event_dev->txa_enqueue = sso_hws_tx_adptr_enq_seg
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_TSTAMP_F)]
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_TSO_F)]
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_MBUF_NOFF_F)]
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_VLAN_QINQ_F)]
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_OL3_OL4_CSUM_F)]
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_L3_L4_CSUM_F)];
+	} else {
+		event_dev->txa_enqueue = sso_hws_tx_adptr_enq
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_TSTAMP_F)]
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_TSO_F)]
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_MBUF_NOFF_F)]
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_VLAN_QINQ_F)]
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_OL3_OL4_CSUM_F)]
+			[!!(dev->tx_offloads & NIX_TX_OFFLOAD_L3_L4_CSUM_F)];
+	}
+
+	event_dev->txa_enqueue_same_dest = event_dev->txa_enqueue;
 }
 
 static void
@@ -379,6 +565,10 @@ cn10k_sso_start(struct rte_eventdev *event_dev)
 {
 	int rc;
 
+	rc = cn10k_sso_updt_tx_adptr_data(event_dev);
+	if (rc < 0)
+		return rc;
+
 	rc = cnxk_sso_start(event_dev, cn10k_sso_hws_reset,
 			    cn10k_sso_hws_flush_events);
 	if (rc < 0)
@@ -407,6 +597,230 @@ cn10k_sso_selftest(void)
 	return cnxk_sso_selftest(RTE_STR(event_cn10k));
 }
 
+static int
+cn10k_sso_rx_adapter_caps_get(const struct rte_eventdev *event_dev,
+			      const struct rte_eth_dev *eth_dev, uint32_t *caps)
+{
+	int rc;
+
+	RTE_SET_USED(event_dev);
+	rc = strncmp(eth_dev->device->driver->name, "net_cn10k", 9);
+	if (rc)
+		*caps = RTE_EVENT_ETH_RX_ADAPTER_SW_CAP;
+	else
+		*caps = RTE_EVENT_ETH_RX_ADAPTER_CAP_INTERNAL_PORT |
+			RTE_EVENT_ETH_RX_ADAPTER_CAP_MULTI_EVENTQ |
+			RTE_EVENT_ETH_RX_ADAPTER_CAP_OVERRIDE_FLOW_ID |
+			RTE_EVENT_ETH_RX_ADAPTER_CAP_EVENT_VECTOR;
+
+	return 0;
+}
+
+static void
+cn10k_sso_set_priv_mem(const struct rte_eventdev *event_dev, void *lookup_mem,
+		       void *tstmp_info)
+{
+	struct cnxk_sso_evdev *dev = cnxk_sso_pmd_priv(event_dev);
+	int i;
+
+	for (i = 0; i < dev->nb_event_ports; i++) {
+		struct cn10k_sso_hws *ws = event_dev->data->ports[i];
+		ws->lookup_mem = lookup_mem;
+		ws->tstamp = tstmp_info;
+	}
+}
+
+static int
+cn10k_sso_rx_adapter_queue_add(
+	const struct rte_eventdev *event_dev, const struct rte_eth_dev *eth_dev,
+	int32_t rx_queue_id,
+	const struct rte_event_eth_rx_adapter_queue_conf *queue_conf)
+{
+	struct cn10k_eth_rxq *rxq;
+	void *lookup_mem;
+	void *tstmp_info;
+	int rc;
+
+	rc = strncmp(eth_dev->device->driver->name, "net_cn10k", 8);
+	if (rc)
+		return -EINVAL;
+
+	rc = cnxk_sso_rx_adapter_queue_add(event_dev, eth_dev, rx_queue_id,
+					   queue_conf);
+	if (rc)
+		return -EINVAL;
+	rxq = eth_dev->data->rx_queues[0];
+	lookup_mem = rxq->lookup_mem;
+	tstmp_info = rxq->tstamp;
+	cn10k_sso_set_priv_mem(event_dev, lookup_mem, tstmp_info);
+	cn10k_sso_fp_fns_set((struct rte_eventdev *)(uintptr_t)event_dev);
+
+	return 0;
+}
+
+static int
+cn10k_sso_rx_adapter_queue_del(const struct rte_eventdev *event_dev,
+			       const struct rte_eth_dev *eth_dev,
+			       int32_t rx_queue_id)
+{
+	int rc;
+
+	rc = strncmp(eth_dev->device->driver->name, "net_cn10k", 8);
+	if (rc)
+		return -EINVAL;
+
+	return cnxk_sso_rx_adapter_queue_del(event_dev, eth_dev, rx_queue_id);
+}
+
+static int
+cn10k_sso_rx_adapter_vector_limits(
+	const struct rte_eventdev *dev, const struct rte_eth_dev *eth_dev,
+	struct rte_event_eth_rx_adapter_vector_limits *limits)
+{
+	struct cnxk_eth_dev *cnxk_eth_dev;
+	int ret;
+
+	RTE_SET_USED(dev);
+	ret = strncmp(eth_dev->device->driver->name, "net_cn10k", 8);
+	if (ret)
+		return -ENOTSUP;
+
+	cnxk_eth_dev = cnxk_eth_pmd_priv(eth_dev);
+	limits->log2_sz = true;
+	limits->min_sz = 1 << ROC_NIX_VWQE_MIN_SIZE_LOG2;
+	limits->max_sz = 1 << ROC_NIX_VWQE_MAX_SIZE_LOG2;
+	limits->min_timeout_ns =
+		(roc_nix_get_vwqe_interval(&cnxk_eth_dev->nix) + 1) * 100;
+	limits->max_timeout_ns = BITMASK_ULL(8, 0) * limits->min_timeout_ns;
+
+	return 0;
+}
+
+static int
+cnxk_sso_rx_adapter_vwqe_enable(struct cnxk_eth_dev *cnxk_eth_dev,
+				uint16_t port_id, uint16_t rq_id, uint16_t sz,
+				uint64_t tmo_ns, struct rte_mempool *vmp)
+{
+	struct roc_nix_rq *rq;
+
+	rq = &cnxk_eth_dev->rqs[rq_id];
+
+	if (!rq->sso_ena)
+		return -EINVAL;
+	if (rq->flow_tag_width == 0)
+		return -EINVAL;
+
+	rq->vwqe_ena = 1;
+	rq->vwqe_first_skip = 0;
+	rq->vwqe_aura_handle = roc_npa_aura_handle_to_aura(vmp->pool_id);
+	rq->vwqe_max_sz_exp = rte_log2_u32(sz);
+	rq->vwqe_wait_tmo =
+		tmo_ns /
+		((roc_nix_get_vwqe_interval(&cnxk_eth_dev->nix) + 1) * 100);
+	rq->tag_mask = (port_id & 0xF) << 20;
+	rq->tag_mask |=
+		(((port_id >> 4) & 0xF) | (RTE_EVENT_TYPE_ETHDEV_VECTOR << 4))
+		<< 24;
+
+	return roc_nix_rq_modify(&cnxk_eth_dev->nix, rq, 0);
+}
+
+static int
+cn10k_sso_rx_adapter_vector_config(
+	const struct rte_eventdev *event_dev, const struct rte_eth_dev *eth_dev,
+	int32_t rx_queue_id,
+	const struct rte_event_eth_rx_adapter_event_vector_config *config)
+{
+	struct cnxk_eth_dev *cnxk_eth_dev;
+	struct cnxk_sso_evdev *dev;
+	int i, rc;
+
+	rc = strncmp(eth_dev->device->driver->name, "net_cn10k", 8);
+	if (rc)
+		return -EINVAL;
+
+	dev = cnxk_sso_pmd_priv(event_dev);
+	cnxk_eth_dev = cnxk_eth_pmd_priv(eth_dev);
+	if (rx_queue_id < 0) {
+		for (i = 0; i < eth_dev->data->nb_rx_queues; i++) {
+			cnxk_sso_updt_xae_cnt(dev, config->vector_mp,
+					      RTE_EVENT_TYPE_ETHDEV_VECTOR);
+			rc = cnxk_sso_xae_reconfigure(
+				(struct rte_eventdev *)(uintptr_t)event_dev);
+			rc = cnxk_sso_rx_adapter_vwqe_enable(
+				cnxk_eth_dev, eth_dev->data->port_id, i,
+				config->vector_sz, config->vector_timeout_ns,
+				config->vector_mp);
+			if (rc)
+				return -EINVAL;
+		}
+	} else {
+
+		cnxk_sso_updt_xae_cnt(dev, config->vector_mp,
+				      RTE_EVENT_TYPE_ETHDEV_VECTOR);
+		rc = cnxk_sso_xae_reconfigure(
+			(struct rte_eventdev *)(uintptr_t)event_dev);
+		rc = cnxk_sso_rx_adapter_vwqe_enable(
+			cnxk_eth_dev, eth_dev->data->port_id, rx_queue_id,
+			config->vector_sz, config->vector_timeout_ns,
+			config->vector_mp);
+		if (rc)
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int
+cn10k_sso_tx_adapter_caps_get(const struct rte_eventdev *dev,
+			      const struct rte_eth_dev *eth_dev, uint32_t *caps)
+{
+	int ret;
+
+	RTE_SET_USED(dev);
+	ret = strncmp(eth_dev->device->driver->name, "net_cn10k", 8);
+	if (ret)
+		*caps = 0;
+	else
+		*caps = RTE_EVENT_ETH_TX_ADAPTER_CAP_INTERNAL_PORT |
+			RTE_EVENT_ETH_TX_ADAPTER_CAP_EVENT_VECTOR;
+
+	return 0;
+}
+
+static int
+cn10k_sso_tx_adapter_queue_add(uint8_t id, const struct rte_eventdev *event_dev,
+			       const struct rte_eth_dev *eth_dev,
+			       int32_t tx_queue_id)
+{
+	int rc;
+
+	RTE_SET_USED(id);
+	rc = cnxk_sso_tx_adapter_queue_add(event_dev, eth_dev, tx_queue_id);
+	if (rc < 0)
+		return rc;
+	rc = cn10k_sso_updt_tx_adptr_data(event_dev);
+	if (rc < 0)
+		return rc;
+	cn10k_sso_fp_fns_set((struct rte_eventdev *)(uintptr_t)event_dev);
+
+	return 0;
+}
+
+static int
+cn10k_sso_tx_adapter_queue_del(uint8_t id, const struct rte_eventdev *event_dev,
+			       const struct rte_eth_dev *eth_dev,
+			       int32_t tx_queue_id)
+{
+	int rc;
+
+	RTE_SET_USED(id);
+	rc = cnxk_sso_tx_adapter_queue_del(event_dev, eth_dev, tx_queue_id);
+	if (rc < 0)
+		return rc;
+	return cn10k_sso_updt_tx_adptr_data(event_dev);
+}
+
 static struct rte_eventdev_ops cn10k_sso_dev_ops = {
 	.dev_infos_get = cn10k_sso_info_get,
 	.dev_configure = cn10k_sso_dev_configure,
@@ -419,6 +833,20 @@ static struct rte_eventdev_ops cn10k_sso_dev_ops = {
 	.port_link = cn10k_sso_port_link,
 	.port_unlink = cn10k_sso_port_unlink,
 	.timeout_ticks = cnxk_sso_timeout_ticks,
+
+	.eth_rx_adapter_caps_get = cn10k_sso_rx_adapter_caps_get,
+	.eth_rx_adapter_queue_add = cn10k_sso_rx_adapter_queue_add,
+	.eth_rx_adapter_queue_del = cn10k_sso_rx_adapter_queue_del,
+	.eth_rx_adapter_start = cnxk_sso_rx_adapter_start,
+	.eth_rx_adapter_stop = cnxk_sso_rx_adapter_stop,
+
+	.eth_rx_adapter_vector_limits_get = cn10k_sso_rx_adapter_vector_limits,
+	.eth_rx_adapter_event_vector_config =
+		cn10k_sso_rx_adapter_vector_config,
+
+	.eth_tx_adapter_caps_get = cn10k_sso_tx_adapter_caps_get,
+	.eth_tx_adapter_queue_add = cn10k_sso_tx_adapter_queue_add,
+	.eth_tx_adapter_queue_del = cn10k_sso_tx_adapter_queue_del,
 
 	.timer_adapter_caps_get = cnxk_tim_caps_get,
 
@@ -502,6 +930,7 @@ RTE_PMD_REGISTER_PCI_TABLE(event_cn10k, cn10k_pci_sso_map);
 RTE_PMD_REGISTER_KMOD_DEP(event_cn10k, "vfio-pci");
 RTE_PMD_REGISTER_PARAM_STRING(event_cn10k, CNXK_SSO_XAE_CNT "=<int>"
 			      CNXK_SSO_GGRP_QOS "=<string>"
+			      CNXK_SSO_FORCE_BP "=1"
 			      CN10K_SSO_GW_MODE "=<int>"
 			      CNXK_TIM_DISABLE_NPA "=1"
 			      CNXK_TIM_CHNK_SLOTS "=<int>"

@@ -58,7 +58,7 @@ cnxk_cpt_dev_config(struct rte_cryptodev *dev,
 	uint16_t nb_lf_avail, nb_lf;
 	int ret;
 
-	dev->feature_flags &= ~conf->ff_disable;
+	dev->feature_flags = cnxk_cpt_default_ff_get() & ~conf->ff_disable;
 
 	nb_lf_avail = roc_cpt->nb_lf_avail;
 	nb_lf = conf->nb_queue_pairs;
@@ -95,7 +95,13 @@ cnxk_cpt_dev_config(struct rte_cryptodev *dev,
 int
 cnxk_cpt_dev_start(struct rte_cryptodev *dev)
 {
-	RTE_SET_USED(dev);
+	struct cnxk_cpt_vf *vf = dev->data->dev_private;
+	struct roc_cpt *roc_cpt = &vf->cpt;
+	uint16_t nb_lf = roc_cpt->nb_lf;
+	uint16_t qp_id;
+
+	for (qp_id = 0; qp_id < nb_lf; qp_id++)
+		roc_cpt_iq_enable(roc_cpt->lf[qp_id]);
 
 	return 0;
 }
@@ -103,7 +109,13 @@ cnxk_cpt_dev_start(struct rte_cryptodev *dev)
 void
 cnxk_cpt_dev_stop(struct rte_cryptodev *dev)
 {
-	RTE_SET_USED(dev);
+	struct cnxk_cpt_vf *vf = dev->data->dev_private;
+	struct roc_cpt *roc_cpt = &vf->cpt;
+	uint16_t nb_lf = roc_cpt->nb_lf;
+	uint16_t qp_id;
+
+	for (qp_id = 0; qp_id < nb_lf; qp_id++)
+		roc_cpt_iq_disable(roc_cpt->lf[qp_id]);
 }
 
 int
@@ -139,7 +151,7 @@ cnxk_cpt_dev_info_get(struct rte_cryptodev *dev,
 	struct roc_cpt *roc_cpt = &vf->cpt;
 
 	info->max_nb_queue_pairs = roc_cpt->nb_lf_avail;
-	info->feature_flags = dev->feature_flags;
+	info->feature_flags = cnxk_cpt_default_ff_get();
 	info->capabilities = cnxk_crypto_capabilities_get(vf);
 	info->sym.max_nb_sessions = 0;
 	info->min_mbuf_headroom_req = CNXK_CPT_MIN_HEADROOM_REQ;
@@ -540,6 +552,11 @@ sym_session_configure(struct roc_cpt *roc_cpt, int driver_id,
 	if ((sess_priv->roc_se_ctx.fc_type == ROC_SE_HASH_HMAC) &&
 	    cpt_mac_len_verify(&xform->auth)) {
 		plt_dp_err("MAC length is not supported");
+		if (sess_priv->roc_se_ctx.auth_key != NULL) {
+			plt_free(sess_priv->roc_se_ctx.auth_key);
+			sess_priv->roc_se_ctx.auth_key = NULL;
+		}
+
 		ret = -ENOTSUP;
 		goto priv_put;
 	}
@@ -575,10 +592,16 @@ void
 sym_session_clear(int driver_id, struct rte_cryptodev_sym_session *sess)
 {
 	void *priv = get_sym_session_private_data(sess, driver_id);
+	struct cnxk_se_sess *sess_priv;
 	struct rte_mempool *pool;
 
 	if (priv == NULL)
 		return;
+
+	sess_priv = priv;
+
+	if (sess_priv->roc_se_ctx.auth_key != NULL)
+		plt_free(sess_priv->roc_se_ctx.auth_key);
 
 	memset(priv, 0, cnxk_cpt_sym_session_get_size(NULL));
 

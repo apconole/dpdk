@@ -1116,6 +1116,8 @@ hns3vf_interrupt_handler(void *param)
 
 	/* Read out interrupt causes */
 	event_cause = hns3vf_check_event_cause(hns, &clearval);
+	/* Clear interrupt causes */
+	hns3vf_clear_event_cause(hw, clearval);
 
 	switch (event_cause) {
 	case HNS3VF_VECTOR0_EVENT_RST:
@@ -1127,9 +1129,6 @@ hns3vf_interrupt_handler(void *param)
 	default:
 		break;
 	}
-
-	/* Clear interrupt causes */
-	hns3vf_clear_event_cause(hw, clearval);
 
 	/* Enable interrupt */
 	hns3vf_enable_irq0(hw);
@@ -1408,27 +1407,47 @@ hns3vf_get_queue_depth(struct hns3_hw *hw)
 	return 0;
 }
 
-static int
-hns3vf_get_tc_info(struct hns3_hw *hw)
+static void
+hns3vf_update_caps(struct hns3_hw *hw, uint32_t caps)
 {
-	uint8_t resp_msg;
-	int ret;
+	if (hns3_get_bit(caps, HNS3VF_CAPS_VLAN_FLT_MOD_B))
+		hns3_set_bit(hw->capability,
+				HNS3_DEV_SUPPORT_VF_VLAN_FLT_MOD_B, 1);
+}
+
+static int
+hns3vf_get_num_tc(struct hns3_hw *hw)
+{
+	uint8_t num_tc = 0;
 	uint32_t i;
-
-	ret = hns3_send_mbx_msg(hw, HNS3_MBX_GET_TCINFO, 0, NULL, 0,
-				true, &resp_msg, sizeof(resp_msg));
-	if (ret) {
-		hns3_err(hw, "VF request to get TC info from PF failed %d",
-			 ret);
-		return ret;
-	}
-
-	hw->hw_tc_map = resp_msg;
 
 	for (i = 0; i < HNS3_MAX_TC_NUM; i++) {
 		if (hw->hw_tc_map & BIT(i))
-			hw->num_tc++;
+			num_tc++;
 	}
+	return num_tc;
+}
+
+static int
+hns3vf_get_basic_info(struct hns3_hw *hw)
+{
+	uint8_t resp_msg[HNS3_MBX_MAX_RESP_DATA_SIZE];
+	struct hns3_basic_info *basic_info;
+	int ret;
+
+	ret = hns3_send_mbx_msg(hw, HNS3_MBX_GET_BASIC_INFO, 0, NULL, 0,
+				true, resp_msg, sizeof(resp_msg));
+	if (ret) {
+		hns3_err(hw, "failed to get basic info from PF, ret = %d.",
+				ret);
+		return ret;
+	}
+
+	basic_info = (struct hns3_basic_info *)resp_msg;
+	hw->hw_tc_map = basic_info->hw_tc_map;
+	hw->num_tc = hns3vf_get_num_tc(hw);
+	hw->pf_vf_if_version = basic_info->pf_vf_if_version;
+	hns3vf_update_caps(hw, basic_info->caps);
 
 	return 0;
 }
@@ -1468,6 +1487,11 @@ hns3vf_get_configuration(struct hns3_hw *hw)
 
 	hns3vf_get_push_lsc_cap(hw);
 
+	/* Get basic info from PF */
+	ret = hns3vf_get_basic_info(hw);
+	if (ret)
+		return ret;
+
 	/* Get queue configuration from PF */
 	ret = hns3vf_get_queue_info(hw);
 	if (ret)
@@ -1483,12 +1507,7 @@ hns3vf_get_configuration(struct hns3_hw *hw)
 	if (ret)
 		return ret;
 
-	ret = hns3vf_get_port_base_vlan_filter_state(hw);
-	if (ret)
-		return ret;
-
-	/* Get tc configuration from PF */
-	return hns3vf_get_tc_info(hw);
+	return hns3vf_get_port_base_vlan_filter_state(hw);
 }
 
 static int
@@ -1599,6 +1618,26 @@ hns3vf_vlan_filter_set(struct rte_eth_dev *dev, uint16_t vlan_id, int on)
 }
 
 static int
+hns3vf_en_vlan_filter(struct hns3_hw *hw, bool enable)
+{
+	uint8_t msg_data;
+	int ret;
+
+	if (!hns3_dev_vf_vlan_flt_supported(hw))
+		return 0;
+
+	msg_data = enable ? 1 : 0;
+	ret = hns3_send_mbx_msg(hw, HNS3_MBX_SET_VLAN,
+			HNS3_MBX_ENABLE_VLAN_FILTER, &msg_data,
+			sizeof(msg_data), true, NULL, 0);
+	if (ret)
+		hns3_err(hw, "%s vlan filter failed, ret = %d.",
+				enable ? "enable" : "disable", ret);
+
+	return ret;
+}
+
+static int
 hns3vf_en_hw_strip_rxvtag(struct hns3_hw *hw, bool enable)
 {
 	uint8_t msg_data;
@@ -1629,6 +1668,19 @@ hns3vf_vlan_offload_set(struct rte_eth_dev *dev, int mask)
 	}
 
 	tmp_mask = (unsigned int)mask;
+
+	if (tmp_mask & ETH_VLAN_FILTER_MASK) {
+		rte_spinlock_lock(&hw->lock);
+		/* Enable or disable VLAN filter */
+		if (dev_conf->rxmode.offloads & DEV_RX_OFFLOAD_VLAN_FILTER)
+			ret = hns3vf_en_vlan_filter(hw, true);
+		else
+			ret = hns3vf_en_vlan_filter(hw, false);
+		rte_spinlock_unlock(&hw->lock);
+		if (ret)
+			return ret;
+	}
+
 	/* Vlan stripping setting */
 	if (tmp_mask & ETH_VLAN_STRIP_MASK) {
 		rte_spinlock_lock(&hw->lock);
@@ -1726,9 +1778,10 @@ hns3vf_dev_configure_vlan(struct rte_eth_dev *dev)
 	}
 
 	/* Apply vlan offload setting */
-	ret = hns3vf_vlan_offload_set(dev, ETH_VLAN_STRIP_MASK);
+	ret = hns3vf_vlan_offload_set(dev, ETH_VLAN_STRIP_MASK |
+					ETH_VLAN_FILTER_MASK);
 	if (ret)
-		hns3_err(hw, "dev config vlan offload failed, ret =%d", ret);
+		hns3_err(hw, "dev config vlan offload failed, ret = %d.", ret);
 
 	return ret;
 }
@@ -2018,6 +2071,7 @@ hns3vf_uninit_vf(struct rte_eth_dev *eth_dev)
 	(void)hns3_config_gro(hw, false);
 	(void)hns3vf_set_alive(hw, false);
 	(void)hns3vf_set_promisc_mode(hw, false, false, false);
+	hns3_flow_uninit(eth_dev);
 	hns3_tqp_stats_uninit(hw);
 	hns3vf_disable_irq0(hw);
 	rte_intr_disable(&pci_dev->intr_handle);
@@ -2133,11 +2187,8 @@ hns3vf_dev_close(struct rte_eth_dev *eth_dev)
 	struct hns3_hw *hw = &hns->hw;
 	int ret = 0;
 
-	if (rte_eal_process_type() != RTE_PROC_PRIMARY) {
-		rte_free(eth_dev->process_private);
-		eth_dev->process_private = NULL;
+	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
 		return 0;
-	}
 
 	if (hw->adapter_state == HNS3_NIC_STARTED)
 		ret = hns3vf_dev_stop(eth_dev);
@@ -2151,8 +2202,6 @@ hns3vf_dev_close(struct rte_eth_dev *eth_dev)
 	hns3vf_uninit_vf(eth_dev);
 	hns3_free_all_queues(eth_dev);
 	rte_free(hw->reset.wait_data);
-	rte_free(eth_dev->process_private);
-	eth_dev->process_private = NULL;
 	hns3_mp_uninit_primary();
 	hns3_warn(hw, "Close port %u finished", hw->data->port_id);
 
@@ -2909,15 +2958,6 @@ hns3vf_dev_init(struct rte_eth_dev *eth_dev)
 
 	PMD_INIT_FUNC_TRACE();
 
-	eth_dev->process_private = (struct hns3_process_private *)
-	    rte_zmalloc_socket("hns3_filter_list",
-			       sizeof(struct hns3_process_private),
-			       RTE_CACHE_LINE_SIZE, eth_dev->device->numa_node);
-	if (eth_dev->process_private == NULL) {
-		PMD_INIT_LOG(ERR, "Failed to alloc memory for process private");
-		return -ENOMEM;
-	}
-
 	hns3_flow_init(eth_dev);
 
 	hns3_set_rxtx_function(eth_dev);
@@ -3019,8 +3059,6 @@ err_mp_init_secondary:
 	eth_dev->tx_pkt_burst = NULL;
 	eth_dev->tx_pkt_prepare = NULL;
 	eth_dev->tx_descriptor_status = NULL;
-	rte_free(eth_dev->process_private);
-	eth_dev->process_private = NULL;
 
 	return ret;
 }
@@ -3033,11 +3071,8 @@ hns3vf_dev_uninit(struct rte_eth_dev *eth_dev)
 
 	PMD_INIT_FUNC_TRACE();
 
-	if (rte_eal_process_type() != RTE_PROC_PRIMARY) {
-		rte_free(eth_dev->process_private);
-		eth_dev->process_private = NULL;
+	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
 		return 0;
-	}
 
 	if (hw->adapter_state < HNS3_NIC_CLOSING)
 		hns3vf_dev_close(eth_dev);

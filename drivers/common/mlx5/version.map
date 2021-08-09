@@ -3,6 +3,10 @@ INTERNAL {
 
 	haswell_broadwell_cpu;
 
+	mlx5_auxiliary_get_child_name; # WINDOWS_NO_EXPORT
+
+	mlx5_class_driver_register;
+
 	mlx5_common_init;
 
 	mlx5_common_verbs_reg_mr; # WINDOWS_NO_EXPORT
@@ -10,7 +14,8 @@ INTERNAL {
 
 	mlx5_create_mr_ext;
 
-	mlx5_dev_to_pci_addr; # WINDOWS_NO_EXPORT
+	mlx5_dev_is_pci;
+	mlx5_dev_to_pci_str;
 
 	mlx5_devx_alloc_uar; # WINDOWS_NO_EXPORT
 
@@ -70,8 +75,16 @@ INTERNAL {
 	mlx5_free;
 
 	mlx5_get_ifname_sysfs; # WINDOWS_NO_EXPORT
+	mlx5_get_pci_addr; # WINDOWS_NO_EXPORT
 
 	mlx5_glue;
+
+	mlx5_list_create;
+	mlx5_list_register;
+	mlx5_list_unregister;
+	mlx5_list_lookup;
+	mlx5_list_get_entry_num;
+	mlx5_list_destroy;
 
 	mlx5_hlist_create;
 	mlx5_hlist_lookup;
@@ -125,12 +138,10 @@ INTERNAL {
 	mlx5_nl_vlan_vmwa_create; # WINDOWS_NO_EXPORT
 	mlx5_nl_vlan_vmwa_delete; # WINDOWS_NO_EXPORT
 
-	mlx5_pci_driver_register;
-
 	mlx5_os_alloc_pd;
 	mlx5_os_dealloc_pd;
 	mlx5_os_dereg_mr;
-	mlx5_os_get_ibv_device; # WINDOWS_NO_EXPORT
+	mlx5_os_get_ibv_dev; # WINDOWS_NO_EXPORT
 	mlx5_os_reg_mr;
 	mlx5_os_umem_dereg;
 	mlx5_os_umem_reg;

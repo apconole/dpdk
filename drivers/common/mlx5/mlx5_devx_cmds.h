@@ -89,6 +89,11 @@ struct mlx5_hca_vdpa_attr {
 	uint64_t doorbell_bar_offset;
 };
 
+struct mlx5_hca_flow_attr {
+	uint32_t tunnel_header_0_1;
+	uint32_t tunnel_header_2_3;
+};
+
 /* HCA supports this number of time periods for LRO. */
 #define MLX5_LRO_NUM_SUPP_PERIODS 4
 
@@ -136,6 +141,7 @@ struct mlx5_hca_attr {
 	uint32_t roce:1;
 	uint32_t rq_ts_format:2;
 	uint32_t sq_ts_format:2;
+	uint32_t steering_format_version:4;
 	uint32_t qp_ts_format:2;
 	uint32_t regex:1;
 	uint32_t reg_c_preserve:1;
@@ -148,6 +154,8 @@ struct mlx5_hca_attr {
 	uint32_t crypto_login:1; /* General obj type CRYPTO_LOGIN supported. */
 	uint32_t regexp_num_of_engines;
 	uint32_t log_max_ft_sampler_num:8;
+	uint32_t inner_ipv4_ihl:1;
+	uint32_t outer_ipv4_ihl:1;
 	uint32_t geneve_tlv_opt;
 	uint32_t cqe_compression:1;
 	uint32_t mini_cqe_resp_flow_tag:1;
@@ -155,6 +163,7 @@ struct mlx5_hca_attr {
 	uint32_t pkt_integrity_match:1; /* 1 if HW supports integrity item */
 	struct mlx5_hca_qos_attr qos;
 	struct mlx5_hca_vdpa_attr vdpa;
+	struct mlx5_hca_flow_attr flow;
 	int log_max_qp_sz;
 	int log_max_cq_sz;
 	int log_max_qp;

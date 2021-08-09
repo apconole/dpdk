@@ -119,6 +119,7 @@ sfc_ef100_rx_qpush(struct sfc_ef100_rxq *rxq, unsigned int added)
 	 * operations that follow it (i.e. doorbell write).
 	 */
 	rte_write32(dword.ed_u32[0], rxq->doorbell);
+	rxq->dp.dpq.rx_dbells++;
 
 	sfc_ef100_rx_debug(rxq, "RxQ pushed doorbell at pidx %u (added=%u)",
 			   EFX_DWORD_FIELD(dword, ERF_GZ_RX_RING_PIDX),
@@ -892,6 +893,20 @@ sfc_ef100_rx_intr_disable(struct sfc_dp_rxq *dp_rxq)
 	return 0;
 }
 
+static sfc_dp_rx_get_pushed_t sfc_ef100_rx_get_pushed;
+static unsigned int
+sfc_ef100_rx_get_pushed(struct sfc_dp_rxq *dp_rxq)
+{
+	struct sfc_ef100_rxq *rxq = sfc_ef100_rxq_by_dp_rxq(dp_rxq);
+
+	/*
+	 * The datapath keeps track only of added descriptors, since
+	 * the number of pushed descriptors always equals the number
+	 * of added descriptors due to enforced alignment.
+	 */
+	return rxq->added;
+}
+
 struct sfc_dp_rx sfc_ef100_rx = {
 	.dp = {
 		.name		= SFC_KVARG_DATAPATH_EF100,
@@ -919,5 +934,6 @@ struct sfc_dp_rx sfc_ef100_rx = {
 	.qdesc_status		= sfc_ef100_rx_qdesc_status,
 	.intr_enable		= sfc_ef100_rx_intr_enable,
 	.intr_disable		= sfc_ef100_rx_intr_disable,
+	.get_pushed		= sfc_ef100_rx_get_pushed,
 	.pkt_burst		= sfc_ef100_recv_pkts,
 };

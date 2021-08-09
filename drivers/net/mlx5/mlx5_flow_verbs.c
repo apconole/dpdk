@@ -1257,6 +1257,7 @@ flow_verbs_validate(struct rte_eth_dev *dev,
 	uint8_t next_protocol = 0xff;
 	uint16_t ether_type = 0;
 	bool is_empty_vlan = false;
+	uint16_t udp_dport = 0;
 
 	if (items == NULL)
 		return -1;
@@ -1364,6 +1365,15 @@ flow_verbs_validate(struct rte_eth_dev *dev,
 			ret = mlx5_flow_validate_item_udp(items, item_flags,
 							  next_protocol,
 							  error);
+			const struct rte_flow_item_udp *spec = items->spec;
+			const struct rte_flow_item_udp *mask = items->mask;
+			if (!mask)
+				mask = &rte_flow_item_udp_mask;
+			if (spec != NULL)
+				udp_dport = rte_be_to_cpu_16
+						(spec->hdr.dst_port &
+						 mask->hdr.dst_port);
+
 			if (ret < 0)
 				return ret;
 			last_item = tunnel ? MLX5_FLOW_LAYER_INNER_L4_UDP :
@@ -1381,8 +1391,9 @@ flow_verbs_validate(struct rte_eth_dev *dev,
 					     MLX5_FLOW_LAYER_OUTER_L4_TCP;
 			break;
 		case RTE_FLOW_ITEM_TYPE_VXLAN:
-			ret = mlx5_flow_validate_item_vxlan(items, item_flags,
-							    error);
+			ret = mlx5_flow_validate_item_vxlan(dev, udp_dport,
+							    items, item_flags,
+							    attr, error);
 			if (ret < 0)
 				return ret;
 			last_item = MLX5_FLOW_LAYER_VXLAN;
@@ -1820,8 +1831,9 @@ flow_verbs_translate(struct rte_eth_dev *dev,
 			flow_verbs_translate_item_tcp(dev_flow, items,
 						      item_flags);
 			subpriority = MLX5_PRIORITY_MAP_L4;
-			dev_flow->hash_fields |=
-				mlx5_flow_hashfields_adjust
+			if (dev_flow->hash_fields != 0)
+				dev_flow->hash_fields |=
+					mlx5_flow_hashfields_adjust
 					(rss_desc, tunnel, ETH_RSS_TCP,
 					 (IBV_RX_HASH_SRC_PORT_TCP |
 					  IBV_RX_HASH_DST_PORT_TCP));
@@ -1832,8 +1844,9 @@ flow_verbs_translate(struct rte_eth_dev *dev,
 			flow_verbs_translate_item_udp(dev_flow, items,
 						      item_flags);
 			subpriority = MLX5_PRIORITY_MAP_L4;
-			dev_flow->hash_fields |=
-				mlx5_flow_hashfields_adjust
+			if (dev_flow->hash_fields != 0)
+				dev_flow->hash_fields |=
+					mlx5_flow_hashfields_adjust
 					(rss_desc, tunnel, ETH_RSS_UDP,
 					 (IBV_RX_HASH_SRC_PORT_UDP |
 					  IBV_RX_HASH_DST_PORT_UDP));

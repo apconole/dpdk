@@ -10,10 +10,33 @@
 #include <sys/mman.h>
 #include <inttypes.h>
 
+#include <rte_errno.h>
+#include <rte_bus_pci.h>
+#include <rte_bus_auxiliary.h>
+
+#include "mlx5_common_utils.h"
+#include "mlx5_common_log.h"
+#include "mlx5_common_private.h"
 #include "mlx5_autoconf.h"
 #include <mlx5_glue.h>
 #include <mlx5_common.h>
 #include <mlx5_common_mr.h>
+
+struct ibv_device *
+mlx5_os_get_ibv_dev(const struct rte_device *dev)
+{
+	struct ibv_device *ibv;
+
+	if (mlx5_dev_is_pci(dev))
+		ibv = mlx5_os_get_ibv_device(&RTE_DEV_TO_PCI_CONST(dev)->addr);
+	else
+		ibv = mlx5_get_aux_ibv_device(RTE_DEV_TO_AUXILIARY_CONST(dev));
+	if (ibv == NULL) {
+		rte_errno = ENODEV;
+		DRV_LOG(ERR, "Verbs device not found: %s", dev->name);
+	}
+	return ibv;
+}
 
 /**
  * Register mr. Given protection domain pointer, pointer to addr and length
@@ -68,4 +91,3 @@ mlx5_common_verbs_dereg_mr(struct mlx5_pmd_mr *pmd_mr)
 		memset(pmd_mr, 0, sizeof(*pmd_mr));
 	}
 }
-

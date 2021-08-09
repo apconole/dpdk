@@ -5,7 +5,7 @@
 #include <rte_malloc.h>
 #include <rte_log.h>
 #include <rte_errno.h>
-#include <rte_pci.h>
+#include <rte_bus_pci.h>
 #include <rte_spinlock.h>
 #include <rte_comp.h>
 #include <rte_compressdev.h>
@@ -13,7 +13,6 @@
 
 #include <mlx5_glue.h>
 #include <mlx5_common.h>
-#include <mlx5_common_pci.h>
 #include <mlx5_devx_cmds.h>
 #include <mlx5_common_os.h>
 #include <mlx5_common_devx.h>
@@ -37,7 +36,6 @@ struct mlx5_compress_xform {
 struct mlx5_compress_priv {
 	TAILQ_ENTRY(mlx5_compress_priv) next;
 	struct ibv_context *ctx; /* Device context. */
-	struct rte_pci_device *pci_dev;
 	struct rte_compressdev *cdev;
 	void *uar;
 	uint32_t pdn; /* Protection Domain number. */
@@ -209,7 +207,7 @@ mlx5_compress_qp_setup(struct rte_compressdev *dev, uint16_t qp_id,
 		return -rte_errno;
 	}
 	dev->data->queue_pairs[qp_id] = qp;
-	opaq_buf = rte_calloc(__func__, 1u << log_ops_n,
+	opaq_buf = rte_calloc(__func__, (size_t)1 << log_ops_n,
 			      sizeof(struct mlx5_gga_compress_opaque),
 			      sizeof(struct mlx5_gga_compress_opaque));
 	if (opaq_buf == NULL) {
@@ -258,6 +256,8 @@ mlx5_compress_qp_setup(struct rte_compressdev *dev, uint16_t qp_id,
 		DRV_LOG(ERR, "Can't change SQ state to ready.");
 		goto err;
 	}
+	/* Save pointer of global generation number to check memory event. */
+	qp->mr_ctrl.dev_gen_ptr = &priv->mr_scache.dev_gen;
 	DRV_LOG(INFO, "QP %u: SQN=0x%X CQN=0x%X entries num = %u",
 		(uint32_t)qp_id, qp->sq.sq->id, qp->cq.cq->id, qp->entries_n);
 	return 0;
@@ -316,12 +316,19 @@ mlx5_compress_xform_create(struct rte_compressdev *dev,
 			size /= MLX5_GGA_COMP_WIN_SIZE_UNITS;
 			xfrm->gga_ctrl1 += RTE_MIN(rte_log2_u32(size),
 					 MLX5_COMP_MAX_WIN_SIZE_CONF) <<
-					   WQE_GGA_COMP_WIN_SIZE_OFFSET;
-			if (xform->compress.level == RTE_COMP_LEVEL_PMD_DEFAULT)
+						WQE_GGA_COMP_WIN_SIZE_OFFSET;
+			switch (xform->compress.level) {
+			case RTE_COMP_LEVEL_PMD_DEFAULT:
 				size = MLX5_GGA_COMP_LOG_BLOCK_SIZE_MAX;
-			else
-				size = priv->min_block_size - 1 +
-							  xform->compress.level;
+				break;
+			case RTE_COMP_LEVEL_MAX:
+				size = priv->min_block_size;
+				break;
+			default:
+				size = RTE_MAX(MLX5_GGA_COMP_LOG_BLOCK_SIZE_MAX
+					+ 1 - xform->compress.level,
+					priv->min_block_size);
+			}
 			xfrm->gga_ctrl1 += RTE_MIN(size,
 					    MLX5_GGA_COMP_LOG_BLOCK_SIZE_MAX) <<
 						 WQE_GGA_COMP_BLOCK_SIZE_OFFSET;
@@ -428,6 +435,40 @@ static struct rte_compressdev_ops mlx5_compress_ops = {
 	.stream_free		= NULL,
 };
 
+/**
+ * Query LKey from a packet buffer for QP. If not found, add the mempool.
+ *
+ * @param priv
+ *   Pointer to the priv object.
+ * @param addr
+ *   Search key.
+ * @param mr_ctrl
+ *   Pointer to per-queue MR control structure.
+ * @param ol_flags
+ *   Mbuf offload features.
+ *
+ * @return
+ *   Searched LKey on success, UINT32_MAX on no match.
+ */
+static __rte_always_inline uint32_t
+mlx5_compress_addr2mr(struct mlx5_compress_priv *priv, uintptr_t addr,
+		      struct mlx5_mr_ctrl *mr_ctrl, uint64_t ol_flags)
+{
+	uint32_t lkey;
+
+	/* Check generation bit to see if there's any change on existing MRs. */
+	if (unlikely(*mr_ctrl->dev_gen_ptr != mr_ctrl->cur_gen))
+		mlx5_mr_flush_local_cache(mr_ctrl);
+	/* Linear search on MR cache array. */
+	lkey = mlx5_mr_lookup_lkey(mr_ctrl->cache, &mr_ctrl->mru,
+				   MLX5_MR_CACHE_N, addr);
+	if (likely(lkey != UINT32_MAX))
+		return lkey;
+	/* Take slower bottom-half on miss. */
+	return mlx5_mr_addr2mr_bh(priv->pd, 0, &priv->mr_scache, mr_ctrl, addr,
+				  !!(ol_flags & EXT_ATTACHED_MBUF));
+}
+
 static __rte_always_inline uint32_t
 mlx5_compress_dseg_set(struct mlx5_compress_qp *qp,
 		       volatile struct mlx5_wqe_dseg *restrict dseg,
@@ -437,9 +478,8 @@ mlx5_compress_dseg_set(struct mlx5_compress_qp *qp,
 	uintptr_t addr = rte_pktmbuf_mtod_offset(mbuf, uintptr_t, offset);
 
 	dseg->bcount = rte_cpu_to_be_32(len);
-	dseg->lkey = mlx5_mr_addr2mr_bh(qp->priv->pd, 0, &qp->priv->mr_scache,
-					&qp->mr_ctrl, addr,
-					!!(mbuf->ol_flags & EXT_ATTACHED_MBUF));
+	dseg->lkey = mlx5_compress_addr2mr(qp->priv, addr, &qp->mr_ctrl,
+					   mbuf->ol_flags);
 	dseg->pbuf = rte_cpu_to_be_64(addr);
 	return dseg->lkey;
 }
@@ -712,22 +752,41 @@ mlx5_compress_hw_global_prepare(struct mlx5_compress_priv *priv)
 }
 
 /**
- * DPDK callback to register a PCI device.
+ * Callback for memory event.
  *
- * This function spawns compress device out of a given PCI device.
- *
- * @param[in] pci_drv
- *   PCI driver structure (mlx5_compress_driver).
- * @param[in] pci_dev
- *   PCI device information.
- *
- * @return
- *   0 on success, 1 to skip this driver, a negative errno value otherwise
- *   and rte_errno is set.
+ * @param event_type
+ *   Memory event type.
+ * @param addr
+ *   Address of memory.
+ * @param len
+ *   Size of memory.
  */
+static void
+mlx5_compress_mr_mem_event_cb(enum rte_mem_event event_type, const void *addr,
+			      size_t len, void *arg __rte_unused)
+{
+	struct mlx5_compress_priv *priv;
+
+	/* Must be called from the primary process. */
+	MLX5_ASSERT(rte_eal_process_type() == RTE_PROC_PRIMARY);
+	switch (event_type) {
+	case RTE_MEM_EVENT_FREE:
+		pthread_mutex_lock(&priv_list_lock);
+		/* Iterate all the existing mlx5 devices. */
+		TAILQ_FOREACH(priv, &mlx5_compress_priv_list, next)
+			mlx5_free_mr_by_addr(&priv->mr_scache,
+					     priv->ctx->device->name,
+					     addr, len);
+		pthread_mutex_unlock(&priv_list_lock);
+		break;
+	case RTE_MEM_EVENT_ALLOC:
+	default:
+		break;
+	}
+}
+
 static int
-mlx5_compress_pci_probe(struct rte_pci_driver *pci_drv,
-			struct rte_pci_device *pci_dev)
+mlx5_compress_dev_probe(struct rte_device *dev)
 {
 	struct ibv_device *ibv;
 	struct rte_compressdev *cdev;
@@ -736,24 +795,17 @@ mlx5_compress_pci_probe(struct rte_pci_driver *pci_drv,
 	struct mlx5_hca_attr att = { 0 };
 	struct rte_compressdev_pmd_init_params init_params = {
 		.name = "",
-		.socket_id = pci_dev->device.numa_node,
+		.socket_id = dev->numa_node,
 	};
 
-	RTE_SET_USED(pci_drv);
 	if (rte_eal_process_type() != RTE_PROC_PRIMARY) {
 		DRV_LOG(ERR, "Non-primary process type is not supported.");
 		rte_errno = ENOTSUP;
 		return -rte_errno;
 	}
-	ibv = mlx5_os_get_ibv_device(&pci_dev->addr);
-	if (ibv == NULL) {
-		DRV_LOG(ERR, "No matching IB device for PCI slot "
-			PCI_PRI_FMT ".", pci_dev->addr.domain,
-			pci_dev->addr.bus, pci_dev->addr.devid,
-			pci_dev->addr.function);
+	ibv = mlx5_os_get_ibv_dev(dev);
+	if (ibv == NULL)
 		return -rte_errno;
-	}
-	DRV_LOG(INFO, "PCI information matches for device \"%s\".", ibv->name);
 	ctx = mlx5_glue->dv_open_device(ibv);
 	if (ctx == NULL) {
 		DRV_LOG(ERR, "Failed to open IB device \"%s\".", ibv->name);
@@ -769,7 +821,7 @@ mlx5_compress_pci_probe(struct rte_pci_driver *pci_drv,
 		rte_errno = ENOTSUP;
 		return -ENOTSUP;
 	}
-	cdev = rte_compressdev_pmd_create(ibv->name, &pci_dev->device,
+	cdev = rte_compressdev_pmd_create(ibv->name, dev,
 					  sizeof(*priv), &init_params);
 	if (cdev == NULL) {
 		DRV_LOG(ERR, "Failed to create device \"%s\".", ibv->name);
@@ -784,7 +836,6 @@ mlx5_compress_pci_probe(struct rte_pci_driver *pci_drv,
 	cdev->feature_flags = RTE_COMPDEV_FF_HW_ACCELERATED;
 	priv = cdev->data->dev_private;
 	priv->ctx = ctx;
-	priv->pci_dev = pci_dev;
 	priv->cdev = cdev;
 	priv->min_block_size = att.compress_min_block_size;
 	priv->sq_ts_format = att.sq_ts_format;
@@ -804,36 +855,33 @@ mlx5_compress_pci_probe(struct rte_pci_driver *pci_drv,
 	}
 	priv->mr_scache.reg_mr_cb = mlx5_common_verbs_reg_mr;
 	priv->mr_scache.dereg_mr_cb = mlx5_common_verbs_dereg_mr;
+	/* Register callback function for global shared MR cache management. */
+	if (TAILQ_EMPTY(&mlx5_compress_priv_list))
+		rte_mem_event_callback_register("MLX5_MEM_EVENT_CB",
+						mlx5_compress_mr_mem_event_cb,
+						NULL);
 	pthread_mutex_lock(&priv_list_lock);
 	TAILQ_INSERT_TAIL(&mlx5_compress_priv_list, priv, next);
 	pthread_mutex_unlock(&priv_list_lock);
 	return 0;
 }
 
-/**
- * DPDK callback to remove a PCI device.
- *
- * This function removes all compress devices belong to a given PCI device.
- *
- * @param[in] pci_dev
- *   Pointer to the PCI device.
- *
- * @return
- *   0 on success, the function cannot fail.
- */
 static int
-mlx5_compress_pci_remove(struct rte_pci_device *pdev)
+mlx5_compress_dev_remove(struct rte_device *dev)
 {
 	struct mlx5_compress_priv *priv = NULL;
 
 	pthread_mutex_lock(&priv_list_lock);
 	TAILQ_FOREACH(priv, &mlx5_compress_priv_list, next)
-		if (rte_pci_addr_cmp(&priv->pci_dev->addr, &pdev->addr) != 0)
+		if (priv->cdev->device == dev)
 			break;
 	if (priv)
 		TAILQ_REMOVE(&mlx5_compress_priv_list, priv, next);
 	pthread_mutex_unlock(&priv_list_lock);
 	if (priv) {
+		if (TAILQ_EMPTY(&mlx5_compress_priv_list))
+			rte_mem_event_callback_unregister("MLX5_MEM_EVENT_CB",
+							  NULL);
 		mlx5_mr_release_cache(&priv->mr_scache);
 		mlx5_compress_hw_global_release(priv);
 		rte_compressdev_pmd_destroy(priv->cdev);
@@ -852,24 +900,19 @@ static const struct rte_pci_id mlx5_compress_pci_id_map[] = {
 	}
 };
 
-static struct mlx5_pci_driver mlx5_compress_driver = {
-	.driver_class = MLX5_CLASS_COMPRESS,
-	.pci_driver = {
-		.driver = {
-			.name = RTE_STR(MLX5_COMPRESS_DRIVER_NAME),
-		},
-		.id_table = mlx5_compress_pci_id_map,
-		.probe = mlx5_compress_pci_probe,
-		.remove = mlx5_compress_pci_remove,
-		.drv_flags = 0,
-	},
+static struct mlx5_class_driver mlx5_compress_driver = {
+	.drv_class = MLX5_CLASS_COMPRESS,
+	.name = RTE_STR(MLX5_COMPRESS_DRIVER_NAME),
+	.id_table = mlx5_compress_pci_id_map,
+	.probe = mlx5_compress_dev_probe,
+	.remove = mlx5_compress_dev_remove,
 };
 
 RTE_INIT(rte_mlx5_compress_init)
 {
 	mlx5_common_init();
 	if (mlx5_glue != NULL)
-		mlx5_pci_driver_register(&mlx5_compress_driver);
+		mlx5_class_driver_register(&mlx5_compress_driver);
 }
 
 RTE_LOG_REGISTER_DEFAULT(mlx5_compress_logtype, NOTICE)

@@ -13,7 +13,7 @@
 #define CNXK_CPT_MAX_CAPS	 34
 #define CNXK_SEC_CRYPTO_MAX_CAPS 4
 #define CNXK_SEC_MAX_CAPS	 3
-#define CNXK_AE_EC_ID_MAX	 5
+#define CNXK_AE_EC_ID_MAX	 8
 /**
  * Device private data
  */
@@ -27,6 +27,7 @@ struct cnxk_cpt_vf {
 	struct roc_ae_ec_group *ec_grp[CNXK_AE_EC_ID_MAX];
 };
 
+uint64_t cnxk_cpt_default_ff_get(void);
 int cnxk_cpt_eng_grp_add(struct roc_cpt *roc_cpt);
 
 #endif /* _CNXK_CRYPTODEV_H_ */

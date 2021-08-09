@@ -99,6 +99,7 @@ Features
 - Hardware LRO.
 - Hairpin.
 - Multiple-thread flow insertion.
+- Matching on IPv4 Internet Header Length (IHL).
 - Matching on GTP extension header with raw encap/decap action.
 - Matching on Geneve TLV option header with raw encap/decap action.
 - RSS support in sample action.
@@ -111,6 +112,8 @@ Features
 - Flow integrity offload API.
 - Connection tracking.
 - Sub-Function representors.
+- Sub-Function.
+
 
 Limitations
 -----------
@@ -192,8 +195,16 @@ Limitations
   size and ``txq_inline_min`` settings and may be from 2 (worst case forced by maximal
   inline settings) to 58.
 
-- Flows with a VXLAN Network Identifier equal (or ends to be equal)
-  to 0 are not supported.
+- Match on VXLAN supports the following fields only:
+
+     - VNI
+     - Last reserved 8-bits
+
+  Last reserved 8-bits matching is only supported When using DV flow
+  engine (``dv_flow_en`` = 1).
+  For ConnectX-5, the UDP destination port must be the standard one (4789).
+  Group zero's behavior may differ which depends on FW.
+  Matching value equals 0 (value & mask) is not supported.
 
 - L3 VXLAN and VXLAN-GPE tunnels cannot be supported together with MPLSoGRE and MPLSoUDP.
 
@@ -412,20 +423,20 @@ Limitations
 - Meter:
 
   - All the meter colors with drop action will be counted only by the global drop statistics.
-  - Green color is not supported with drop action.
-  - Yellow detection is not supported.
+  - Yellow detection is only supported with ASO metering.
   - Red color must be with drop action.
   - Meter statistics are supported only for drop case.
-  - Meter yellow color detection is not supported.
   - A meter action created with pre-defined policy must be the last action in the flow except single case where the policy actions are:
      - green: NULL or END.
      - yellow: NULL or END.
      - RED: DROP / END.
   - The only supported meter policy actions:
-     - green: QUEUE, RSS, PORT_ID, JUMP, MARK and SET_TAG.
-     - yellow: must be empty.
+     - green: QUEUE, RSS, PORT_ID, JUMP, DROP, MARK and SET_TAG.
+     - yellow: QUEUE, RSS, PORT_ID, JUMP, DROP, MARK and SET_TAG.
      - RED: must be DROP.
+  - Policy actions of RSS for green and yellow should have the same configuration except queues.
   - meter profile packet mode is supported.
+  - meter profiles of RFC2697, RFC2698 and RFC4115 are supported.
 
 - Integrity:
 
@@ -447,6 +458,11 @@ Limitations
   - Flow rules insertion rate and memory consumption need more optimization.
   - 256 ports maximum.
   - 4M connections maximum.
+
+- Multi-thread flow insertion:
+
+  - In order to achieve best insertion rate, application should manage the flows per lcore.
+  - Better to disable memory reclaim by setting ``reclaim_mem_mode`` to 0 to accelerate the flow object allocation and release with cache.
 
 Statistics
 ----------
@@ -1461,44 +1477,56 @@ the DPDK application.
 
         echo -n "<device pci address" > /sys/bus/pci/drivers/mlx5_core/unbind
 
-5. Enbale switchdev mode::
+5. Enable switchdev mode::
 
         echo switchdev > /sys/class/net/<net device>/compat/devlink/mode
 
-Sub-Function representor
-------------------------
+Sub-Function support
+--------------------
 
 Sub-Function is a portion of the PCI device, a SF netdev has its own
-dedicated queues(txq, rxq). A SF netdev supports E-Switch representation
-offload similar to existing PF and VF representors. A SF shares PCI
-level resources with other SFs and/or with its parent PCI function.
+dedicated queues (txq, rxq).
+A SF shares PCI level resources with other SFs and/or with its parent PCI function.
+
+0. Requirement::
+
+        OFED version >= 5.4-0.3.3.0
 
 1. Configure SF feature::
 
-        mlxconfig -d <mst device> set PF_BAR2_SIZE=<0/1/2/3> PF_BAR2_ENABLE=1
+        # Run mlxconfig on both PFs on host and ECPFs on BlueField.
+        mlxconfig -d <mst device> set PER_PF_NUM_SF=1 PF_TOTAL_SF=252 PF_SF_BAR_SIZE=12
 
-        Value of PF_BAR2_SIZE:
+2. Enable switchdev mode::
 
-            0: 8 SFs
-            1: 16 SFs
-            2: 32 SFs
-            3: 64 SFs
+        mlxdevm dev eswitch set pci/<DBDF> mode switchdev
 
-2. Reset the FW::
+3. Add SF port::
 
-        mlxfwreset -d <mst device> reset
+        mlxdevm port add pci/<DBDF> flavour pcisf pfnum 0 sfnum <sfnum>
 
-3. Enable switchdev mode::
+        Get SFID from output: pci/<DBDF>/<SFID>
 
-        echo switchdev > /sys/class/net/<net device>/compat/devlink/mode
+4. Modify MAC address::
 
-4. Create SF::
+        mlxdevm port function set pci/<DBDF>/<SFID> hw_addr <MAC>
 
-        mlnx-sf -d <PCI_BDF> -a create
+5. Activate SF port::
 
-5. Probe SF representor::
+        mlxdevm port function set pci/<DBDF>/<ID> state active
 
-        testpmd> port attach <PCI_BDF>,representor=sf0,dv_flow_en=1
+6. Devargs to probe SF device::
+
+        auxiliary:mlx5_core.sf.<num>,dv_flow_en=1
+
+Sub-Function representor support
+--------------------------------
+
+A SF netdev supports E-Switch representation offload
+similar to PF and VF representors.
+Use <sfnum> to probe SF representor::
+
+        testpmd> port attach <PCI_BDF>,representor=sf<sfnum>,dv_flow_en=1
 
 Performance tuning
 ------------------
@@ -1711,6 +1739,16 @@ Supported hardware offloads
    |                       | |  OFED 4.7-3   | | OFED 4.7-3    |
    |                       | |  rdma-core 26 | | rdma-core 26  |
    |                       | |  ConnectX-5   | | ConnectX-5    |
+   +-----------------------+-----------------+-----------------+
+   | ASO Metering          | |  DPDK 21.05   | | DPDK 21.05    |
+   |                       | |  OFED 5.3     | | OFED 5.3      |
+   |                       | |  rdma-core 33 | | rdma-core 33  |
+   |                       | |  ConnectX-6 Dx| | ConnectX-6 Dx |
+   +-----------------------+-----------------+-----------------+
+   | Metering Hierarchy    | |  DPDK 21.08   | | DPDK 21.08    |
+   |                       | |  OFED 5.3     | | OFED 5.3      |
+   |                       | |  N/A          | | N/A           |
+   |                       | |  ConnectX-6 Dx| | ConnectX-6 Dx |
    +-----------------------+-----------------+-----------------+
    | Sampling              | |  DPDK 20.11   | | DPDK 20.11    |
    |                       | |  OFED 5.1-2   | | OFED 5.1-2    |

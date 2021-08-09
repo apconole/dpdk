@@ -66,6 +66,8 @@ enum eth_cmd_id {
 	ETH_CMD_INTERNAL_LBK = 7,
 	ETH_CMD_MODE_CHANGE = 11, /* hot plug support */
 	ETH_CMD_INTF_SHUTDOWN = 12,
+	ETH_CMD_GET_SUPPORTED_FEC = 18,
+	ETH_CMD_SET_FEC = 19,
 	ETH_CMD_SET_PTP_MODE = 34,
 };
 
@@ -109,6 +111,9 @@ enum eth_cmd_own {
 #define SCR0_ETH_LNK_STS_S_LMAC_TYPE   GENMASK_ULL(35, 28)
 #define SCR0_ETH_LNK_STS_S_MODE	       GENMASK_ULL(43, 36)
 
+/* struct eth_fec_types_s */
+#define SCR0_ETH_FEC_TYPES_S_FEC GENMASK_ULL(10, 9)
+
 /* scratchx(1) CSR used for non-secure SW->ATF communication
  * This CSR acts as a command register
  */
@@ -125,6 +130,9 @@ enum eth_cmd_own {
 #define SCR1_ETH_MODE_CHANGE_ARGS_AN	 BIT_ULL(13)
 #define SCR1_ETH_MODE_CHANGE_ARGS_PORT	 GENMASK_ULL(21, 14)
 #define SCR1_ETH_MODE_CHANGE_ARGS_MODE	 GENMASK_ULL(63, 22)
+
+/* struct eth_set_fec_args */
+#define SCR1_ETH_SET_FEC_ARGS GENMASK_ULL(9, 8)
 
 #define SCR1_OWN_STATUS GENMASK_ULL(1, 0)
 

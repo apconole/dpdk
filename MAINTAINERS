@@ -420,6 +420,7 @@ F: examples/bbdev_app/
 F: doc/guides/sample_app_ug/bbdev_app.rst
 
 Crypto API
+M: Akhil Goyal <gakhil@marvell.com>
 M: Declan Doherty <declan.doherty@intel.com>
 T: git://dpdk.org/next/dpdk-next-crypto
 F: lib/cryptodev/
@@ -590,7 +591,7 @@ F: doc/guides/nics/features/af_xdp.ini
 Amazon ENA
 M: Marcin Wojtas <mw@semihalf.com>
 M: Michal Krawczyk <mk@semihalf.com>
-M: Guy Tzalik <gtzalik@amazon.com>
+M: Shai Brandes <shaibran@amazon.com>
 M: Evgeny Schemeilin <evgenys@amazon.com>
 M: Igor Chauskin <igorch@amazon.com>
 F: drivers/net/ena/
@@ -603,9 +604,9 @@ F: drivers/net/axgbe/
 F: doc/guides/nics/axgbe.rst
 F: doc/guides/nics/features/axgbe.ini
 
-Aquantia atlantic
-M: Igor Russkikh <igor.russkikh@aquantia.com>
-M: Pavel Belous <pavel.belous@aquantia.com>
+Marvell/Aquantia atlantic
+M: Igor Russkikh <irusskikh@marvell.com>
+T: git://dpdk.org/next/dpdk-next-net-mrvl
 F: drivers/net/atlantic/
 F: doc/guides/nics/atlantic.rst
 F: doc/guides/nics/features/atlantic.ini
@@ -879,7 +880,7 @@ F: drivers/net/ionic/
 F: doc/guides/nics/ionic.rst
 F: doc/guides/nics/features/ionic.ini
 
-QLogic bnx2x
+Marvell QLogic bnx2x
 M: Rasesh Mody <rmody@marvell.com>
 M: Shahed Shaikh <shshaikh@marvell.com>
 T: git://dpdk.org/next/dpdk-next-net-mrvl
@@ -887,10 +888,9 @@ F: drivers/net/bnx2x/
 F: doc/guides/nics/bnx2x.rst
 F: doc/guides/nics/features/bnx2x*.ini
 
-QLogic qede PMD
+Marvell QLogic qede PMD
 M: Rasesh Mody <rmody@marvell.com>
 M: Devendra Singh Rawat <dsinghrawat@marvell.com>
-M: Igor Russkikh <irusskikh@marvell.com>
 T: git://dpdk.org/next/dpdk-next-net-mrvl
 F: drivers/net/qede/
 F: doc/guides/nics/qede.rst
@@ -902,6 +902,12 @@ F: drivers/common/sfc_efx/
 F: drivers/net/sfc/
 F: doc/guides/nics/sfc_efx.rst
 F: doc/guides/nics/features/sfc.ini
+
+Wangxun ngbe
+M: Jiawen Wu <jiawenwu@trustnetic.com>
+F: drivers/net/ngbe/
+F: doc/guides/nics/ngbe.rst
+F: doc/guides/nics/features/ngbe.ini
 
 Wangxun txgbe
 M: Jiawen Wu <jiawenwu@trustnetic.com>
@@ -1095,6 +1101,12 @@ M: Anoob Joseph <anoobj@marvell.com>
 F: drivers/crypto/octeontx2/
 F: doc/guides/cryptodevs/octeontx2.rst
 F: doc/guides/cryptodevs/features/octeontx2.ini
+
+Mellanox mlx5
+M: Matan Azrad <matan@nvidia.com>
+F: drivers/crypto/mlx5/
+F: doc/guides/cryptodevs/mlx5.rst
+F: doc/guides/cryptodevs/features/mlx5.ini
 
 Null Crypto
 M: Declan Doherty <declan.doherty@intel.com>

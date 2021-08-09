@@ -200,6 +200,7 @@ struct roc_nix_sq {
 	uint64_t aura_handle;
 	int16_t nb_sqb_bufs_adj;
 	uint16_t nb_sqb_bufs;
+	uint16_t aura_sqb_bufs;
 	plt_iova_t io_addr;
 	void *lmt_addr;
 	void *sqe_mem;
@@ -513,6 +514,9 @@ int __roc_api roc_nix_fc_mode_set(struct roc_nix *roc_nix,
 				  enum roc_nix_fc_mode mode);
 
 enum roc_nix_fc_mode __roc_api roc_nix_fc_mode_get(struct roc_nix *roc_nix);
+
+void __roc_api rox_nix_fc_npa_bp_cfg(struct roc_nix *roc_nix, uint64_t pool_id,
+				     uint8_t ena, uint8_t force);
 
 /* NPC */
 int __roc_api roc_nix_npc_promisc_ena_dis(struct roc_nix *roc_nix, int enable);

@@ -1742,7 +1742,7 @@ List all items from the ptype mapping table::
 
 Where:
 
-* ``valid_only``: A flag indicates if only list valid items(=1) or all itemss(=0).
+* ``valid_only``: A flag indicates if only list valid items(=1) or all items(=0).
 
 Replace a specific or a group of software defined ptype with a new one::
 
@@ -3654,6 +3654,7 @@ This section lists supported pattern items and their attributes, if any.
 
 - ``ipv4``: match IPv4 header.
 
+  - ``version_ihl {unsigned}``: IPv4 version and IP header length.
   - ``tos {unsigned}``: type of service.
   - ``ttl {unsigned}``: time to live.
   - ``proto {unsigned}``: next protocol ID.
@@ -3694,6 +3695,7 @@ This section lists supported pattern items and their attributes, if any.
 - ``vxlan``: match VXLAN header.
 
   - ``vni {unsigned}``: VXLAN identifier.
+  - ``last_rsvd {unsigned}``: VXLAN last reserved 8-bits.
 
 - ``e_tag``: match IEEE 802.1BR E-Tag header.
 
@@ -4840,7 +4842,7 @@ Sample Raw encapsulation rule
 
 Raw encapsulation configuration can be set by the following commands
 
-Eecapsulating VxLAN::
+Encapsulating VxLAN::
 
  testpmd> set raw_encap 4 eth src is 10:11:22:33:44:55 / vlan tci is 1
         inner_type is 0x0800 / ipv4 / udp dst is 4789 / vxlan vni

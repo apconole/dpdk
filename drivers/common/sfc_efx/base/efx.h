@@ -2334,6 +2334,19 @@ efx_ev_qcreate(
 	__deref_out	efx_evq_t **eepp);
 
 LIBEFX_API
+extern	__checkReturn	efx_rc_t
+efx_ev_qcreate_irq(
+	__in		efx_nic_t *enp,
+	__in		unsigned int index,
+	__in		efsys_mem_t *esmp,
+	__in		size_t ndescs,
+	__in		uint32_t id,
+	__in		uint32_t us,
+	__in		uint32_t flags,
+	__in		uint32_t irq,
+	__deref_out	efx_evq_t **eepp);
+
+LIBEFX_API
 extern		void
 efx_ev_qpost(
 	__in		efx_evq_t *eep,
@@ -2912,6 +2925,7 @@ typedef enum efx_rx_prefix_field_e {
 	EFX_RX_PREFIX_FIELD_USER_MARK_VALID,
 	EFX_RX_PREFIX_FIELD_CSUM_FRAME,
 	EFX_RX_PREFIX_FIELD_INGRESS_VPORT,
+	EFX_RX_PREFIX_FIELD_INGRESS_MPORT = EFX_RX_PREFIX_FIELD_INGRESS_VPORT,
 	EFX_RX_PREFIX_NFIELDS
 } efx_rx_prefix_field_t;
 
@@ -2985,6 +2999,14 @@ typedef enum efx_rxq_type_e {
  * the driver.
  */
 #define	EFX_RXQ_FLAG_RSS_HASH		0x4
+/*
+ * Request ingress mport field in the Rx prefix of a queue.
+ */
+#define	EFX_RXQ_FLAG_INGRESS_MPORT	0x8
+/*
+ * Request user mark field in the Rx prefix of a queue.
+ */
+#define	EFX_RXQ_FLAG_USER_MARK		0x10
 
 LIBEFX_API
 extern	__checkReturn	efx_rc_t
@@ -4071,6 +4093,7 @@ typedef struct efx_mae_limits_s {
 	uint32_t			eml_max_n_outer_prios;
 	uint32_t			eml_encap_types_supported;
 	uint32_t			eml_encap_header_size_limit;
+	uint32_t			eml_max_n_counters;
 } efx_mae_limits_t;
 
 LIBEFX_API
@@ -4284,6 +4307,27 @@ extern	__checkReturn			efx_rc_t
 efx_mae_action_set_populate_encap(
 	__in				efx_mae_actions_t *spec);
 
+/*
+ * Use efx_mae_action_set_fill_in_counter_id() to set ID of a counter
+ * in the specification prior to action set allocation.
+ *
+ * NOTICE: the HW will conduct action COUNT after actions DECAP,
+ * VLAN_POP, VLAN_PUSH (if any) have been applied to the packet,
+ * but, as a workaround, this order is not validated by the API.
+ *
+ * The workaround helps to unblock DPDK + Open vSwitch use case.
+ * In Open vSwitch, this action is always the first to be added,
+ * in particular, it's known to be inserted before action DECAP,
+ * so enforcing the right order here would cause runtime errors.
+ * The existing behaviour in Open vSwitch is unlikely to change
+ * any time soon, and the workaround is a good solution because
+ * in fact the real COUNT order is a don't care to Open vSwitch.
+ */
+LIBEFX_API
+extern	__checkReturn			efx_rc_t
+efx_mae_action_set_populate_count(
+	__in				efx_mae_actions_t *spec);
+
 LIBEFX_API
 extern	__checkReturn			efx_rc_t
 efx_mae_action_set_populate_flag(
@@ -4384,6 +4428,22 @@ efx_mae_action_set_fill_in_eh_id(
 	__in				efx_mae_actions_t *spec,
 	__in				const efx_mae_eh_id_t *eh_idp);
 
+typedef struct efx_counter_s {
+	uint32_t id;
+} efx_counter_t;
+
+LIBEFX_API
+extern	__checkReturn			unsigned int
+efx_mae_action_set_get_nb_count(
+	__in				const efx_mae_actions_t *spec);
+
+/* See description before efx_mae_action_set_populate_count(). */
+LIBEFX_API
+extern	__checkReturn			efx_rc_t
+efx_mae_action_set_fill_in_counter_id(
+	__in				efx_mae_actions_t *spec,
+	__in				const efx_counter_t *counter_idp);
+
 /* Action set ID */
 typedef struct efx_mae_aset_id_s {
 	uint32_t id;
@@ -4395,6 +4455,71 @@ efx_mae_action_set_alloc(
 	__in				efx_nic_t *enp,
 	__in				const efx_mae_actions_t *spec,
 	__out				efx_mae_aset_id_t *aset_idp);
+
+/*
+ * Generation count has two purposes:
+ *
+ * 1) Distinguish between counter packets that belong to freed counter
+ *    and the packets that belong to reallocated counter (with the same ID);
+ * 2) Make sure that all packets are received for a counter that was freed;
+ *
+ * API users should provide generation count out parameter in allocation
+ * function if counters can be reallocated and consistent counter values are
+ * required.
+ *
+ * API users that need consistent final counter values after counter
+ * deallocation or counter stream stop should provide the parameter in
+ * functions that free the counters and stop the counter stream.
+ */
+LIBEFX_API
+extern	__checkReturn			efx_rc_t
+efx_mae_counters_alloc(
+	__in				efx_nic_t *enp,
+	__in				uint32_t n_counters,
+	__out				uint32_t *n_allocatedp,
+	__out_ecount(n_counters)	efx_counter_t *countersp,
+	__out_opt			uint32_t *gen_countp);
+
+LIBEFX_API
+extern	__checkReturn			efx_rc_t
+efx_mae_counters_free(
+	__in				efx_nic_t *enp,
+	__in				uint32_t n_counters,
+	__out				uint32_t *n_freedp,
+	__in_ecount(n_counters)		const efx_counter_t *countersp,
+	__out_opt			uint32_t *gen_countp);
+
+/* When set, include counters with a value of zero */
+#define	EFX_MAE_COUNTERS_STREAM_IN_ZERO_SQUASH_DISABLE	(1U << 0)
+
+/*
+ * Set if credit-based flow control is used. In this case the driver
+ * must call efx_mae_counters_stream_give_credits() to notify the
+ * packetiser of descriptors written.
+ */
+#define	EFX_MAE_COUNTERS_STREAM_OUT_USES_CREDITS	(1U << 0)
+
+LIBEFX_API
+extern	__checkReturn			efx_rc_t
+efx_mae_counters_stream_start(
+	__in				efx_nic_t *enp,
+	__in				uint16_t rxq_id,
+	__in				uint16_t packet_size,
+	__in				uint32_t flags_in,
+	__out				uint32_t *flags_out);
+
+LIBEFX_API
+extern	__checkReturn			efx_rc_t
+efx_mae_counters_stream_stop(
+	__in				efx_nic_t *enp,
+	__in				uint16_t rxq_id,
+	__out_opt			uint32_t *gen_countp);
+
+LIBEFX_API
+extern	__checkReturn			efx_rc_t
+efx_mae_counters_stream_give_credits(
+	__in				efx_nic_t *enp,
+	__in				uint32_t n_credits);
 
 LIBEFX_API
 extern	__checkReturn			efx_rc_t
